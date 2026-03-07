@@ -56,13 +56,23 @@ sudo ./target/release/qanah --config examples/peer3.conf answer
 ### Testing Connectivity
 
 ```bash
-# IPv4
-ping 10.0.0.2   # from Peer 1
-ping 10.0.0.1   # from Peer 2
+# From Peer 1
+ping 10.0.0.2   # to Peer 2
+ping 10.0.0.3   # to Peer 3
+ping6 fd00::2   # to Peer 2 (IPv6)
+ping6 fd00::3   # to Peer 3 (IPv6)
 
-# IPv6
-ping6 fd00::2   # from Peer 1
-ping6 fd00::1   # from Peer 2
+# From Peer 2
+ping 10.0.0.1   # to Peer 1
+ping 10.0.0.3   # to Peer 3
+ping6 fd00::1   # to Peer 1 (IPv6)
+ping6 fd00::3   # to Peer 3 (IPv6)
+
+# From Peer 3
+ping 10.0.0.1   # to Peer 1
+ping 10.0.0.2   # to Peer 2
+ping6 fd00::1   # to Peer 1 (IPv6)
+ping6 fd00::2   # to Peer 2 (IPv6)
 ```
 
 ## CLI Options
@@ -112,12 +122,11 @@ sudo ./target/release/qanah -c peer1.conf \
   --signal-server mqtt.example.com:1883 \
 
 # Manual signaling with custom STUN and TURN
-sudo ./target/release/qanah -c peer1.conf \
+sudo ./target/release/qanah -c examples/peer1.conf \
   --stun stun:mystun.io:3478 \
   --turn-url turn:myturn.io:3478 \
   --turn-username user \
   --turn-credential pass \
-  --manual \
   offer
 
 sudo ./target/release/qanah -c peer1.conf \
@@ -134,7 +143,7 @@ sudo ./target/release/qanah -c peer1.conf \
 1. Parses a WireGuard `.conf` file to extract the interface address, keys, and peer info
 2. Derives a shared secret from your X25519 PrivateKey and the peer's PublicKey
 3. Derives independent keys for tunnel encryption (per-direction) and signaling
-4. Exchanges WebRTC signaling data via MQTT (or manual copy-paste with `--manual`)
+4. Exchanges WebRTC signaling data via MQTT (or manual copy-paste when using subcommands)
 5. Establishes a WebRTC peer connection with ICE/STUN/TURN for NAT traversal
 6. Creates a TUN device with the configured IP address and netmask
 7. Opens a WebRTC data channel labeled `vpn-tunnel`
@@ -159,6 +168,8 @@ The tool reads standard WireGuard config files. Relevant fields:
 | `PublicKey` | `[Peer]` | Peer's X25519 public key used for shared secret derivation |
 | `AllowedIPs` | `[Peer]` | CIDR ranges to route through the tunnel (e.g. `10.0.0.2/32, fd00::2/128`) |
 
+Multiple `[Peer]` sections are supported for mesh networking.
+
 ### Example Config
 
 ```ini
@@ -167,8 +178,12 @@ PrivateKey = <base64-encoded-x25519-private-key>
 Address = 10.0.0.1/24, fd00::1/64
 
 [Peer]
-PublicKey = <base64-encoded-x25519-public-key>
+PublicKey = <base64-encoded-x25519-public-key-peer2>
 AllowedIPs = 10.0.0.2/32, fd00::2/128
+
+[Peer]
+PublicKey = <base64-encoded-x25519-public-key-peer3>
+AllowedIPs = 10.0.0.3/32, fd00::3/128
 ```
 
 ## License
