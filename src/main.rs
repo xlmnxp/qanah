@@ -49,6 +49,10 @@ struct Cli {
     #[arg(long, default_value = "broker.emqx.io:1883")]
     signal_server: String,
 
+    /// Disable relaying: only send to directly connected peers; packets with no direct route are dropped
+    #[arg(long, action = clap::ArgAction::SetTrue)]
+    no_relay: bool,
+
     #[command(subcommand)]
     mode: Option<Mode>,
 }
@@ -79,10 +83,12 @@ async fn main() -> Result<()> {
         .iter()
         .map(|a| a.to_string())
         .collect();
+    let config_path = cli.config.display().to_string();
     info!(
+        config = %config_path,
         addresses = %addresses_display.join(", "),
-        peers = wg_config.peers.len(),
-        "Loaded WireGuard config"
+        peer_count = wg_config.peers.len(),
+        "Loaded config — starting VPN"
     );
 
     if wg_config.peers.is_empty() {
@@ -108,7 +114,7 @@ async fn main() -> Result<()> {
     let our_public_key = crypto::derive_public_key(&wg_config.interface.private_key)?;
 
     // Create TUN device immediately
-    info!("Creating TUN device...");
+    info!("Creating TUN device and setting up routing...");
     let tun_dev = tunnel::create_tun_device(&wg_config)?;
     let (tun_writer, tun_reader) = tun_dev
         .split()
@@ -123,11 +129,16 @@ async fn main() -> Result<()> {
         tunnel::tun_to_peers(tun_reader, rt).await;
     });
 
-    info!("VPN tunnel active (encrypted with ChaCha20-Poly1305). Press Ctrl+C to stop.");
+    info!(
+        "VPN tunnel is up (ChaCha20-Poly1305). Connecting to {} peer(s). Press Ctrl+C to stop.",
+        wg_config.peers.len()
+    );
 
     let private_key = wg_config.interface.private_key.clone();
     let signal_server = cli.signal_server.clone();
     let manual_mode = cli.mode;
+
+    let no_relay = cli.no_relay;
 
     // Spawn each peer connection concurrently
     for (i, peer_config) in wg_config.peers.iter().enumerate() {
@@ -155,13 +166,14 @@ async fn main() -> Result<()> {
                 turn_config,
                 routing_table,
                 tun_writer,
+                no_relay,
             )
             .await;
         });
     }
 
     tokio::signal::ctrl_c().await?;
-    info!("Shutting down...");
+    info!("Shutting down — closing tunnel and disconnecting peers...");
     send_task.abort();
 
     Ok(())
@@ -181,13 +193,20 @@ async fn peer_connection_loop(
     turn_config: Option<Arc<TurnConfig>>,
     routing_table: Arc<RoutingTable>,
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+    no_relay: bool,
 ) {
     const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
     let mut first_attempt = true;
 
     loop {
         if !first_attempt {
-            info!(peer = peer_idx, "Reconnecting in {} seconds...", RECONNECT_DELAY.as_secs());
+            let key_preview = peer_public_key.chars().take(8).collect::<String>();
+            info!(
+                peer = peer_idx,
+                public_key = %format!("{}…", key_preview),
+                delay_secs = RECONNECT_DELAY.as_secs(),
+                "Peer disconnected — reconnecting"
+            );
             tokio::time::sleep(RECONNECT_DELAY).await;
         }
         first_attempt = false;
@@ -204,14 +223,26 @@ async fn peer_connection_loop(
             turn_config.as_deref(),
             routing_table.clone(),
             tun_writer.clone(),
+            no_relay,
         )
         .await
         {
             Ok(()) => {
-                warn!(peer = peer_idx, "Peer disconnected");
+                let key_preview = peer_public_key.chars().take(8).collect::<String>();
+                warn!(
+                    peer = peer_idx,
+                    public_key = %format!("{}…", key_preview),
+                    "Peer disconnected — will retry"
+                );
             }
             Err(e) => {
-                error!(peer = peer_idx, "Failed to connect peer: {e}");
+                let key_preview = peer_public_key.chars().take(8).collect::<String>();
+                error!(
+                    peer = peer_idx,
+                    public_key = %format!("{}…", key_preview),
+                    error = %e,
+                    "Peer connection failed"
+                );
             }
         }
 
@@ -248,6 +279,7 @@ async fn connect_peer(
     turn_config: Option<&TurnConfig>,
     routing_table: Arc<RoutingTable>,
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
+    no_relay: bool,
 ) -> Result<()> {
     let is_offerer = match manual_mode {
         Some(Mode::Offer) => true,
@@ -255,12 +287,13 @@ async fn connect_peer(
         None => is_offerer_for_peer(&our_public_key, peer_public_key)?,
     };
 
+    let key_preview = peer_public_key.chars().take(8).collect::<String>();
+    let peer_label: Arc<str> = Arc::from(format!("Peer {} ({}…)", peer_idx, key_preview));
     let role = if is_offerer { "offerer" } else { "answerer" };
     info!(
-        peer = peer_idx,
-        public_key = %&peer_public_key[..8],
+        peer = %peer_label,
         role = role,
-        "Connecting to peer"
+        "Initiating connection"
     );
 
     let shared_key = crypto::derive_shared_key(private_key, peer_public_key)?;
@@ -268,7 +301,7 @@ async fn connect_peer(
     let encrypt_cipher = PacketCipher::new(&keys.tunnel_send);
     let decrypt_cipher = PacketCipher::new(&keys.tunnel_recv);
 
-    let vpn_peer = VpnPeer::new(stun_urls, turn_config).await?;
+    let vpn_peer = VpnPeer::new(stun_urls, turn_config, Some(peer_label.clone())).await?;
 
     let data_channel = match manual_mode {
         Some(_) => connect_manual(peer_idx, &vpn_peer, is_offerer).await?,
@@ -280,14 +313,18 @@ async fn connect_peer(
     };
 
     // Wait for data channel to open, then register in routing table
-    let dc_open = VpnPeer::setup_data_channel_handler(&data_channel, vpn_peer.packet_tx.clone());
+    let dc_open = VpnPeer::setup_data_channel_handler(
+        &data_channel,
+        vpn_peer.packet_tx.clone(),
+        Some(peer_label.clone()),
+    );
     dc_open.notified().await;
 
     routing_table
         .add_peer(PeerRoute {
             peer_key: peer_public_key.to_string(),
             allowed_ips,
-            can_relay: true,
+            can_relay: !no_relay,
             data_channel: data_channel.clone(),
             encrypt_cipher,
         })
@@ -321,7 +358,7 @@ async fn connect_auto(
         let answer_encoded = sig.offer(&offer_encoded).await?;
         sig.close().await;
         vpn_peer.apply_answer(&answer_encoded).await?;
-        info!(peer = peer_idx, "Answer applied");
+        info!("Signaling complete — answer applied");
         Ok(dc)
     } else {
         let offer_encoded = sig.wait_offer().await?;
@@ -340,7 +377,7 @@ async fn connect_auto(
         sig.answer(&answer_encoded).await?;
         sig.close().await;
 
-        info!(peer = peer_idx, "Waiting for data channel...");
+        info!("Signaling complete — waiting for data channel from peer");
         dc_rx
             .recv()
             .await
@@ -362,7 +399,7 @@ async fn connect_manual(
 
         let answer_encoded = read_signal(&format!("Paste the ANSWER from peer {peer_idx}: "))?;
         vpn_peer.apply_answer(&answer_encoded).await?;
-        info!(peer = peer_idx, "Answer applied");
+        info!("Manual signaling complete — answer applied");
         Ok(dc)
     } else {
         let offer_encoded = read_signal(&format!("Paste the OFFER from peer {peer_idx}: "))?;
@@ -383,7 +420,7 @@ async fn connect_manual(
         println!("{answer_encoded}");
         println!("===== END ANSWER =====\n");
 
-        info!(peer = peer_idx, "Waiting for data channel...");
+        info!("Waiting for data channel from peer");
         dc_rx
             .recv()
             .await

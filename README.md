@@ -6,7 +6,7 @@ A peer-to-peer VPN that uses WireGuard configuration files and establishes encry
 
 Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP or port forwarding.
 
-Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration. When there is no direct connection to a destination (e.g. that peer is offline or not in config), traffic can be routed over another connected peer in a single relay hop.
+Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration. When there is no direct connection to a destination (e.g. that peer is offline or not in config), traffic can be routed over another connected peer in a single relay hop. Relaying can be disabled with `--no-relay` so that only direct peer routes are used.
 
 ## Building
 
@@ -98,6 +98,7 @@ qanah [OPTIONS] --config <CONFIG> [COMMAND]
 | `--turn-username <USERNAME>` | TURN server username (requires `--turn-url`) | *(none)* |
 | `--turn-credential <CREDENTIAL>` | TURN server credential (requires `--turn-url`) | *(none)* |
 | `--signal-server <HOST:PORT>` | MQTT signaling server for automatic SDP exchange | `broker.emqx.io:1883` |
+| `--no-relay` | Disable relaying: only use direct peer routes; packets with no direct route are dropped | relaying enabled |
 | `-h, --help` | Print help | |
 
 ### Examples
@@ -120,6 +121,9 @@ sudo ./target/release/qanah -c peer1.conf \
 # Custom MQTT signaling server
 sudo ./target/release/qanah -c peer1.conf \
   --signal-server mqtt.example.com:1883 \
+
+# Disable relaying (only direct peer routes; no traffic via intermediate peers)
+sudo ./target/release/qanah -c peer1.conf --no-relay
 
 # Manual signaling with custom STUN and TURN
 sudo ./target/release/qanah -c examples/peer1.conf \
