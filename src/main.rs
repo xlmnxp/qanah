@@ -15,8 +15,9 @@ use tracing::info;
 use webrtc::data_channel::RTCDataChannel;
 
 use config::WgConfig;
-use crypto::PacketCipher;
+use crypto::{DerivedKeys, PacketCipher};
 use peer::{TurnConfig, VpnPeer};
+use signaling::SignalingClient;
 
 #[derive(Parser)]
 #[command(name = "qanah")]
@@ -25,6 +26,10 @@ struct Cli {
     /// Path to WireGuard config file
     #[arg(short, long)]
     config: PathBuf,
+
+    /// STUN server URLs (can be specified multiple times; defaults to Google STUN servers)
+    #[arg(long = "stun")]
+    stun_urls: Vec<String>,
 
     /// TURN server URL (e.g. turn:turn.example.com:3478)
     #[arg(long)]
@@ -37,6 +42,14 @@ struct Cli {
     /// TURN server credential
     #[arg(long, requires = "turn_url")]
     turn_credential: Option<String>,
+
+    /// MQTT signaling server (host:port) for automatic SDP exchange
+    #[arg(long, default_value = "broker.hivemq.com:1883")]
+    signal_server: String,
+
+    /// Use manual copy-paste signaling instead of MQTT
+    #[arg(long)]
+    manual: bool,
 
     #[command(subcommand)]
     mode: Mode,
@@ -91,20 +104,105 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("No [Peer] section found — need peer PublicKey for encryption"))?;
 
     let shared_key = crypto::derive_shared_key(&wg_config.interface.private_key, peer_public_key)?;
-    let cipher = PacketCipher::new(&shared_key);
     info!("Derived shared encryption key from PrivateKey + peer PublicKey (ChaCha20-Poly1305)");
 
-    let vpn_peer = VpnPeer::new(turn_config).await?;
+    let stun_urls = if cli.stun_urls.is_empty() {
+        None
+    } else {
+        Some(cli.stun_urls)
+    };
 
-    match cli.mode {
-        Mode::Offer => run_offer(vpn_peer, wg_config, cipher).await?,
-        Mode::Answer => run_answer(vpn_peer, wg_config, cipher).await?,
+    let vpn_peer = VpnPeer::new(stun_urls, turn_config).await?;
+
+    let is_offerer = matches!(cli.mode, Mode::Offer);
+    let keys = DerivedKeys::new(&shared_key, is_offerer);
+    let encrypt_cipher = PacketCipher::new(&keys.tunnel_send);
+    let decrypt_cipher = PacketCipher::new(&keys.tunnel_recv);
+
+    if cli.manual {
+        match cli.mode {
+            Mode::Offer => run_offer_manual(vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await?,
+            Mode::Answer => run_answer_manual(vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await?,
+        }
+    } else {
+        let (host, port) = signaling::parse_signal_server(&cli.signal_server);
+        let signaling = SignalingClient::new(&keys.signaling, host, port)?;
+        match cli.mode {
+            Mode::Offer => run_offer(vpn_peer, wg_config, encrypt_cipher, decrypt_cipher, signaling).await?,
+            Mode::Answer => run_answer(vpn_peer, wg_config, encrypt_cipher, decrypt_cipher, signaling).await?,
+        }
     }
 
     Ok(())
 }
 
-async fn run_offer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher) -> Result<()> {
+// ---------------------------------------------------------------------------
+// Automatic signaling (MQTT)
+// ---------------------------------------------------------------------------
+
+async fn run_offer(
+    vpn_peer: VpnPeer,
+    wg_config: WgConfig,
+    encrypt_cipher: PacketCipher,
+    decrypt_cipher: PacketCipher,
+    mut signaling: SignalingClient,
+) -> Result<()> {
+    let (data_channel, offer_encoded) = vpn_peer.create_offer().await?;
+
+    let answer_encoded = signaling.offer(&offer_encoded).await?;
+    signaling.close().await;
+
+    vpn_peer.apply_answer(&answer_encoded).await?;
+    info!("Answer applied, waiting for connection...");
+
+    start_tunnel(data_channel, vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await
+}
+
+async fn run_answer(
+    vpn_peer: VpnPeer,
+    wg_config: WgConfig,
+    encrypt_cipher: PacketCipher,
+    decrypt_cipher: PacketCipher,
+    mut signaling: SignalingClient,
+) -> Result<()> {
+    let offer_encoded = signaling.wait_offer().await?;
+
+    let (dc_tx, mut dc_rx) = tokio::sync::mpsc::channel::<Arc<RTCDataChannel>>(1);
+
+    vpn_peer.peer_connection.on_data_channel(Box::new(
+        move |dc: Arc<RTCDataChannel>| {
+            let dc_tx = dc_tx.clone();
+            Box::pin(async move {
+                info!(label = %dc.label(), "Received data channel");
+                let _ = dc_tx.send(dc).await;
+            })
+        },
+    ));
+
+    let answer_encoded = vpn_peer.accept_offer(&offer_encoded).await?;
+    signaling.answer(&answer_encoded).await?;
+    signaling.close().await;
+
+    info!("Waiting for data channel from offering peer...");
+
+    let data_channel = dc_rx
+        .recv()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("Data channel was not received"))?;
+
+    start_tunnel(data_channel, vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await
+}
+
+// ---------------------------------------------------------------------------
+// Manual copy-paste signaling (--manual)
+// ---------------------------------------------------------------------------
+
+async fn run_offer_manual(
+    vpn_peer: VpnPeer,
+    wg_config: WgConfig,
+    encrypt_cipher: PacketCipher,
+    decrypt_cipher: PacketCipher,
+) -> Result<()> {
     let (data_channel, offer_encoded) = vpn_peer.create_offer().await?;
 
     println!("\n===== OFFER (copy and send to peer) =====");
@@ -116,10 +214,15 @@ async fn run_offer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher)
 
     info!("Answer applied, waiting for connection...");
 
-    start_tunnel(data_channel, vpn_peer, wg_config, cipher).await
+    start_tunnel(data_channel, vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await
 }
 
-async fn run_answer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher) -> Result<()> {
+async fn run_answer_manual(
+    vpn_peer: VpnPeer,
+    wg_config: WgConfig,
+    encrypt_cipher: PacketCipher,
+    decrypt_cipher: PacketCipher,
+) -> Result<()> {
     let offer_encoded = read_signal("Paste the OFFER from the remote peer: ")?;
 
     let (dc_tx, mut dc_rx) = tokio::sync::mpsc::channel::<Arc<RTCDataChannel>>(1);
@@ -147,14 +250,19 @@ async fn run_answer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher
         .await
         .ok_or_else(|| anyhow::anyhow!("Data channel was not received"))?;
 
-    start_tunnel(data_channel, vpn_peer, wg_config, cipher).await
+    start_tunnel(data_channel, vpn_peer, wg_config, encrypt_cipher, decrypt_cipher).await
 }
+
+// ---------------------------------------------------------------------------
+// Tunnel setup (shared by both modes)
+// ---------------------------------------------------------------------------
 
 async fn start_tunnel(
     data_channel: Arc<RTCDataChannel>,
     vpn_peer: VpnPeer,
     wg_config: WgConfig,
-    cipher: PacketCipher,
+    encrypt_cipher: PacketCipher,
+    decrypt_cipher: PacketCipher,
 ) -> Result<()> {
     let dc_open = VpnPeer::setup_data_channel_handler(&data_channel, vpn_peer.packet_tx.clone());
 
@@ -167,12 +275,10 @@ async fn start_tunnel(
     info!("VPN tunnel active (encrypted with ChaCha20-Poly1305). Press Ctrl+C to stop.");
 
     let dc = data_channel.clone();
-    let encrypt_cipher = cipher.clone();
     let tun_to_dc = tokio::spawn(async move {
         tunnel::tun_to_webrtc(tun_reader, dc, encrypt_cipher, dc_open).await;
     });
 
-    let decrypt_cipher = cipher;
     let dc_to_tun = tokio::spawn(async move {
         tunnel::webrtc_to_tun(tun_writer, vpn_peer.packet_rx, decrypt_cipher).await;
     });

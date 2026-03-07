@@ -14,7 +14,9 @@ cargo build --release
 
 ## Usage
 
-Both peers need a WireGuard-style config file (only the `[Interface]` section's `Address` and `MTU` are used for TUN device configuration).
+Both peers need a WireGuard-style config file. The `[Interface]` section provides the local address and keys, while the `[Peer]` section provides the remote peer's public key and allowed IPs.
+
+By default, Qanah uses an MQTT broker to automatically exchange WebRTC signaling data (offer/answer), so both peers just run one command each and the connection is established.
 
 ### Peer 1 (Initiator)
 
@@ -22,21 +24,29 @@ Both peers need a WireGuard-style config file (only the `[Interface]` section's 
 sudo ./target/release/qanah --config examples/peer1.conf offer
 ```
 
-This prints a base64-encoded **OFFER**. Copy it and send it to Peer 2.
-
 ### Peer 2 (Responder)
 
 ```bash
 sudo ./target/release/qanah --config examples/peer2.conf answer
 ```
 
-Paste the **OFFER** from Peer 1. This prints a base64-encoded **ANSWER**. Copy it and send it back to Peer 1.
+The peers discover each other via the MQTT signaling server and establish a direct WebRTC connection automatically.
 
-### Back on Peer 1
+### Manual Signaling
 
-Paste the **ANSWER** from Peer 2. The WebRTC connection is established and the VPN tunnel is active.
+If you prefer to exchange signaling data manually (copy-paste), use the `--manual` flag:
 
-### Testing connectivity
+```bash
+# Peer 1
+sudo ./target/release/qanah --config examples/peer1.conf --manual offer
+# Copy the printed OFFER and send it to Peer 2
+
+# Peer 2
+sudo ./target/release/qanah --config examples/peer2.conf --manual answer
+# Paste the OFFER, then copy the printed ANSWER and send it back to Peer 1
+```
+
+### Testing Connectivity
 
 ```bash
 # IPv4
@@ -48,36 +58,77 @@ ping6 fd00::2   # from Peer 1
 ping6 fd00::1   # from Peer 2
 ```
 
-### TURN Server (optional)
+## CLI Options
 
-If STUN-only connectivity isn't enough (e.g. symmetric NATs on both sides), you can provide a TURN server via CLI flags:
+```
+qanah [OPTIONS] --config <CONFIG> <COMMAND>
+```
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `offer` | Start as the offering peer (initiator) |
+| `answer` | Start as the answering peer (responder) |
+
+### Options
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `-c, --config <CONFIG>` | Path to WireGuard config file | *(required)* |
+| `--stun <URL>` | STUN server URL (can be specified multiple times) | `stun:stun.l.google.com:19302`, `stun:stun1.l.google.com:19302` |
+| `--turn-url <URL>` | TURN server URL (e.g. `turn:turn.example.com:3478`) | *(none)* |
+| `--turn-username <USERNAME>` | TURN server username (requires `--turn-url`) | *(none)* |
+| `--turn-credential <CREDENTIAL>` | TURN server credential (requires `--turn-url`) | *(none)* |
+| `--signal-server <HOST:PORT>` | MQTT signaling server for automatic SDP exchange | `broker.hivemq.com:1883` |
+| `--manual` | Use manual copy-paste signaling instead of MQTT | `false` |
+| `-h, --help` | Print help | |
+
+### Examples
 
 ```bash
-sudo ./target/release/qanah \
-  --config examples/peer1.conf \
+# Basic usage with defaults
+sudo ./target/release/qanah -c peer1.conf offer
+
+# Custom STUN servers
+sudo ./target/release/qanah -c peer1.conf \
+  --stun stun:stun.example.com:3478 \
+  --stun stun:stun2.example.com:19302 \
+  offer
+
+# With TURN relay
+sudo ./target/release/qanah -c peer1.conf \
   --turn-url turn:turn.example.com:3478 \
   --turn-username myuser \
   --turn-credential mypassword \
   offer
+
+# Custom MQTT signaling server
+sudo ./target/release/qanah -c peer1.conf \
+  --signal-server mqtt.example.com:1883 \
+  offer
+
+# Manual signaling with custom STUN and TURN
+sudo ./target/release/qanah -c peer1.conf \
+  --stun stun:mystun.io:3478 \
+  --turn-url turn:myturn.io:3478 \
+  --turn-username user \
+  --turn-credential pass \
+  --manual \
+  offer
 ```
-
-| Flag | Description |
-|------|-------------|
-| `--turn-url` | TURN server URL (e.g. `turn:turn.example.com:3478` or `turns:turn.example.com:5349`) |
-| `--turn-username` | Username for TURN authentication |
-| `--turn-credential` | Credential/password for TURN authentication |
-
-Both `--turn-username` and `--turn-credential` require `--turn-url` to be set.
 
 ## How It Works
 
-1. Parses a WireGuard `.conf` file to extract the interface address and network settings
+1. Parses a WireGuard `.conf` file to extract the interface address, keys, and peer info
 2. Derives a shared secret from your X25519 PrivateKey and the peer's PublicKey
-3. Creates a TUN device with the configured IP address and netmask
-4. Establishes a WebRTC peer connection using copy-paste signaling (offer/answer exchange)
-5. Opens a WebRTC data channel labeled `vpn-tunnel`
-6. Encrypts all IP packets with ChaCha20-Poly1305 before sending over the data channel
-7. Forwards encrypted packets bidirectionally between the TUN device and the data channel
+3. Derives independent keys for tunnel encryption (per-direction) and signaling
+4. Exchanges WebRTC signaling data via MQTT (or manual copy-paste with `--manual`)
+5. Establishes a WebRTC peer connection with ICE/STUN/TURN for NAT traversal
+6. Creates a TUN device with the configured IP address and netmask
+7. Opens a WebRTC data channel labeled `vpn-tunnel`
+8. Encrypts all IP packets with ChaCha20-Poly1305 before sending over the data channel
+9. Forwards encrypted packets bidirectionally between the TUN device and the data channel
 
 ## Requirements
 
@@ -91,11 +142,23 @@ The tool reads standard WireGuard config files. Relevant fields:
 
 | Field | Section | Description |
 |-------|---------|-------------|
-| `Address` | `[Interface]` | Comma-separated CIDR addresses for the TUN device. Supports IPv4, IPv6, or both (e.g. `10.0.0.1/24, fd00::1/64`) |
-| `MTU` | `[Interface]` | MTU for the TUN device (default: 1400) |
-| `PrivateKey` | `[Interface]` | X25519 private key used for ChaCha20-Poly1305 traffic encryption |
-| `PublicKey` | `[Peer]` | Peer's X25519 public key used for ChaCha20-Poly1305 traffic encryption |
-| `AllowedIPs` | `[Peer]` | Parsed for future routing support |
+| `Address` | `[Interface]` | Comma-separated CIDR addresses for the TUN device (e.g. `10.0.0.1/24, fd00::1/64`) |
+| `MTU` | `[Interface]` | MTU for the TUN device (default: `1400`) |
+| `PrivateKey` | `[Interface]` | X25519 private key used for shared secret derivation |
+| `PublicKey` | `[Peer]` | Peer's X25519 public key used for shared secret derivation |
+| `AllowedIPs` | `[Peer]` | CIDR ranges to route through the tunnel (e.g. `10.0.0.2/32, fd00::2/128`) |
+
+### Example Config
+
+```ini
+[Interface]
+PrivateKey = <base64-encoded-x25519-private-key>
+Address = 10.0.0.1/24, fd00::1/64
+
+[Peer]
+PublicKey = <base64-encoded-x25519-public-key>
+AllowedIPs = 10.0.0.2/32, fd00::2/128
+```
 
 ## Logging
 

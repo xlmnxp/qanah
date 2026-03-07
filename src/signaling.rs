@@ -1,20 +1,26 @@
 use std::io::{Read, Write};
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use base64::engine::general_purpose::{self, GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
 use base64::{alphabet, Engine};
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
+use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, Event, Packet};
 use serde::{Deserialize, Serialize};
+use sha2::{Sha256, Digest};
+use tracing::info;
+use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+use crate::crypto::PacketCipher;
 
 const BASE64_ENCODE: GeneralPurpose = general_purpose::STANDARD;
 const BASE64_DECODE: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
     GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
 );
-use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 /// Serializable wrapper for exchanging SDP + ICE candidates via copy-paste signaling.
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,5 +77,165 @@ impl SignalMessage {
         };
 
         Ok(desc?)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MQTT-based automatic signaling
+// ---------------------------------------------------------------------------
+
+fn derive_room_id(shared_key: &[u8; 32]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(shared_key);
+    hasher.update(b"qanah-signaling-room-v1");
+    let hash = hasher.finalize();
+    hash[..16].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn parse_signal_server(server: &str) -> (&str, u16) {
+    if let Some((host, port_str)) = server.rsplit_once(':') {
+        if let Ok(port) = port_str.parse() {
+            return (host, port);
+        }
+    }
+    (server, 1883)
+}
+
+pub struct SignalingClient {
+    client: AsyncClient,
+    eventloop: EventLoop,
+    room_id: String,
+    cipher: PacketCipher,
+}
+
+impl SignalingClient {
+    pub fn new(shared_key: &[u8; 32], broker_host: &str, broker_port: u16) -> Result<Self> {
+        let room_id = derive_room_id(shared_key);
+        let client_id = format!(
+            "qanah-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                % 100_000
+        );
+
+        let mut opts = MqttOptions::new(&client_id, broker_host, broker_port);
+        opts.set_keep_alive(Duration::from_secs(30));
+
+        let (client, eventloop) = AsyncClient::new(opts, 10);
+        let cipher = PacketCipher::new(shared_key);
+
+        info!(
+            broker = format!("{broker_host}:{broker_port}"),
+            room = %room_id,
+            "Connecting to signaling server"
+        );
+
+        Ok(Self { client, eventloop, room_id, cipher })
+    }
+
+    fn offer_topic(&self) -> String {
+        format!("qanah/{}/offer", self.room_id)
+    }
+
+    fn answer_topic(&self) -> String {
+        format!("qanah/{}/answer", self.room_id)
+    }
+
+    /// Poll the MQTT event loop, returning the next incoming Publish on `topic`.
+    async fn recv_on(&mut self, topic: &str) -> Result<Vec<u8>> {
+        loop {
+            let event = self.eventloop.poll().await
+                .map_err(|e| anyhow::anyhow!("Signaling connection error: {e}"))?;
+            if let Event::Incoming(Packet::Publish(p)) = event {
+                if p.topic == topic {
+                    return Ok(p.payload.to_vec());
+                }
+            }
+        }
+    }
+
+    /// Ensure at least one outgoing publish is acknowledged.
+    async fn flush_pub(&mut self) -> Result<()> {
+        loop {
+            let event = self.eventloop.poll().await
+                .map_err(|e| anyhow::anyhow!("Signaling connection error: {e}"))?;
+            if let Event::Incoming(Packet::PubAck(_)) = event {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Offerer: publish the offer and wait for the answer.
+    pub async fn offer(&mut self, offer_sdp: &str) -> Result<String> {
+        let answer_topic = self.answer_topic();
+        let offer_topic = self.offer_topic();
+
+        self.client.subscribe(&answer_topic, QoS::AtLeastOnce).await
+            .context("Failed to subscribe to answer topic")?;
+
+        let encrypted = self.cipher.encrypt(offer_sdp.as_bytes())?;
+        self.client.publish(&offer_topic, QoS::AtLeastOnce, true, encrypted).await
+            .context("Failed to publish offer")?;
+
+        info!("Offer published, waiting for peer answer...");
+
+        let payload = self.recv_on(&answer_topic).await?;
+        let decrypted = self.cipher.decrypt(&payload)?;
+        let answer = String::from_utf8(decrypted)?;
+
+        info!("Received answer via signaling server");
+        Ok(answer)
+    }
+
+    /// Answerer: wait for the offer.
+    pub async fn wait_offer(&mut self) -> Result<String> {
+        let offer_topic = self.offer_topic();
+
+        self.client.subscribe(&offer_topic, QoS::AtLeastOnce).await
+            .context("Failed to subscribe to offer topic")?;
+
+        info!("Waiting for peer offer...");
+
+        let payload = self.recv_on(&offer_topic).await?;
+        let decrypted = self.cipher.decrypt(&payload)?;
+        let offer = String::from_utf8(decrypted)?;
+
+        info!("Received offer via signaling server");
+        Ok(offer)
+    }
+
+    /// Answerer: publish the answer (blocks until broker acknowledges).
+    pub async fn answer(&mut self, answer_sdp: &str) -> Result<()> {
+        let answer_topic = self.answer_topic();
+
+        let encrypted = self.cipher.encrypt(answer_sdp.as_bytes())?;
+        self.client.publish(&answer_topic, QoS::AtLeastOnce, true, encrypted).await
+            .context("Failed to publish answer")?;
+
+        self.flush_pub().await?;
+        info!("Answer published via signaling server");
+        Ok(())
+    }
+
+    /// Clear retained messages and disconnect (best-effort).
+    pub async fn close(mut self) {
+        let offer_topic = self.offer_topic();
+        let answer_topic = self.answer_topic();
+
+        let _ = self.client.publish(offer_topic, QoS::AtLeastOnce, true, Vec::<u8>::new()).await;
+        let _ = self.client.publish(answer_topic, QoS::AtLeastOnce, true, Vec::<u8>::new()).await;
+
+        // pump the event loop briefly to flush cleanup messages
+        for _ in 0..10 {
+            match tokio::time::timeout(Duration::from_millis(200), self.eventloop.poll()).await {
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+
+        let _ = self.client.disconnect().await;
     }
 }

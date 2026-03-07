@@ -6,6 +6,7 @@ use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::engine::DecodePaddingMode;
 use base64::{alphabet, Engine};
 use chacha20poly1305::aead::{Aead, KeyInit};
+use sha2::{Sha256, Digest};
 
 const BASE64_DECODE: GeneralPurpose = GeneralPurpose::new(
     &alphabet::STANDARD,
@@ -37,6 +38,44 @@ pub fn derive_shared_key(private_key_b64: &str, public_key_b64: &str) -> Result<
     let shared_secret = secret.diffie_hellman(&peer_public);
 
     Ok(shared_secret.to_bytes())
+}
+
+/// Derive a purpose-specific key from the root shared secret.
+/// Each `label` produces a cryptographically independent key.
+pub fn derive_subkey(shared_key: &[u8; 32], label: &[u8]) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(shared_key);
+    h.update(label);
+    h.finalize().into()
+}
+
+/// Keyset derived from the root shared secret so that each
+/// cryptographic context uses an independent key.
+pub struct DerivedKeys {
+    /// Key for the tunnel direction: local → remote
+    pub tunnel_send: [u8; 32],
+    /// Key for the tunnel direction: remote → local
+    pub tunnel_recv: [u8; 32],
+    /// Key for MQTT signaling encryption
+    pub signaling: [u8; 32],
+}
+
+impl DerivedKeys {
+    /// `local_is_offerer` determines which of the two directional keys
+    /// this peer uses for sending vs receiving, ensuring both peers agree.
+    pub fn new(shared_key: &[u8; 32], local_is_offerer: bool) -> Self {
+        let key_a = derive_subkey(shared_key, b"qanah-tunnel-offerer-v1");
+        let key_b = derive_subkey(shared_key, b"qanah-tunnel-answerer-v1");
+        let signaling = derive_subkey(shared_key, b"qanah-signaling-v1");
+
+        let (tunnel_send, tunnel_recv) = if local_is_offerer {
+            (key_a, key_b)
+        } else {
+            (key_b, key_a)
+        };
+
+        Self { tunnel_send, tunnel_recv, signaling }
+    }
 }
 
 /// Encrypts and decrypts VPN packets using ChaCha20-Poly1305.

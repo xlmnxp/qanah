@@ -29,7 +29,7 @@ pub struct VpnPeer {
 }
 
 impl VpnPeer {
-    pub async fn new(turn: Option<TurnConfig>) -> Result<Self> {
+    pub async fn new(stun_urls: Option<Vec<String>>, turn: Option<TurnConfig>) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
 
@@ -41,16 +41,20 @@ impl VpnPeer {
             .with_interceptor_registry(registry)
             .build();
 
-        let mut ice_servers = vec![
-            RTCIceServer {
-                urls: vec!["stun:stun.l.google.com:19302".to_string()],
+        let stun_list = stun_urls.unwrap_or_else(|| {
+            vec![
+                "stun:stun.l.google.com:19302".to_string(),
+                "stun:stun1.l.google.com:19302".to_string(),
+            ]
+        });
+
+        let mut ice_servers: Vec<RTCIceServer> = stun_list
+            .into_iter()
+            .map(|url| RTCIceServer {
+                urls: vec![url],
                 ..Default::default()
-            },
-            RTCIceServer {
-                urls: vec!["stun:stun1.l.google.com:19302".to_string()],
-                ..Default::default()
-            },
-        ];
+            })
+            .collect();
 
         if let Some(turn) = turn {
             ice_servers.push(RTCIceServer {
