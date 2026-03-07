@@ -6,7 +6,7 @@ A peer-to-peer VPN that uses WireGuard configuration files and establishes encry
 
 Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP or port forwarding.
 
-Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration.
+Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration. When there is no direct connection to a destination (e.g. that peer is offline or not in config), traffic can be routed over another connected peer in a single relay hop.
 
 ## Building
 
@@ -134,7 +134,6 @@ sudo ./target/release/qanah -c peer1.conf \
   --turn-url turn:myturn.io:3478 \
   --turn-username user \
   --turn-credential pass \
-  --manual \
   answer
 ```
 
@@ -149,6 +148,7 @@ sudo ./target/release/qanah -c peer1.conf \
 7. Opens a WebRTC data channel labeled `vpn-tunnel`
 8. Encrypts all IP packets with ChaCha20-Poly1305 before sending over the data channel
 9. Forwards encrypted packets bidirectionally between the TUN device and the data channel
+10. If no peer has the destination in its AllowedIPs (no direct route), sends the packet to the first connected peer as a relay envelope; that peer decrypts and routes the inner packet (direct or to its TUN), so traffic can reach destinations via one relay hop
 
 ## Requirements
 

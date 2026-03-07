@@ -1,6 +1,6 @@
 [package]
 name = "qanah"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "GPL-2.0-or-later"
 description = "A WebRTC-based VPN that uses WireGuard configuration files, secured with ChaCha20-Poly1305 and X25519 key exchange"
