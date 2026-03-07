@@ -3,11 +3,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
+use webrtc::data_channel::RTCDataChannel;
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
 use webrtc::api::APIBuilder;
 use webrtc::data_channel::data_channel_message::DataChannelMessage;
-use webrtc::data_channel::RTCDataChannel;
 use webrtc::ice_transport::ice_server::RTCIceServer;
 use webrtc::interceptor::registry::Registry;
 use webrtc::peer_connection::configuration::RTCConfiguration;
@@ -31,7 +31,12 @@ pub struct VpnPeer {
 }
 
 impl VpnPeer {
-    pub async fn new(stun_urls: Option<Vec<String>>, turn: Option<&TurnConfig>) -> Result<Self> {
+    /// Create a new VPN peer. `peer_label` is used in log messages (e.g. "Peer 2 (abc12345…)").
+    pub async fn new(
+        stun_urls: Option<Vec<String>>,
+        turn: Option<&TurnConfig>,
+        peer_label: Option<Arc<str>>,
+    ) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
 
@@ -76,24 +81,33 @@ impl VpnPeer {
 
         let disconnected = Arc::new(Notify::new());
         let disconnect_notify = disconnected.clone();
+        let label = peer_label.clone();
 
         peer_connection.on_peer_connection_state_change(Box::new(
             move |state: RTCPeerConnectionState| {
+                let peer = label.as_deref().unwrap_or("(unknown peer)");
                 match state {
-                    RTCPeerConnectionState::Connected => info!("Peer connected!"),
+                    RTCPeerConnectionState::Connected => {
+                        info!(peer = %peer, "WebRTC connection established");
+                    }
                     RTCPeerConnectionState::Disconnected => {
-                        warn!("Peer disconnected");
+                        warn!(peer = %peer, "WebRTC disconnected (may reconnect)");
                         disconnect_notify.notify_one();
                     }
                     RTCPeerConnectionState::Failed => {
-                        error!("Peer connection failed");
+                        error!(peer = %peer, "WebRTC connection failed");
                         disconnect_notify.notify_one();
                     }
                     RTCPeerConnectionState::Closed => {
-                        info!("Peer connection closed");
+                        info!(peer = %peer, "WebRTC connection closed");
                         disconnect_notify.notify_one();
                     }
-                    _ => info!("Peer connection state: {state}"),
+                    RTCPeerConnectionState::Connecting => {
+                        info!(peer = %peer, "WebRTC connecting...");
+                    }
+                    other => {
+                        tracing::debug!(peer = %peer, state = ?other, "Peer connection state");
+                    }
                 }
                 Box::pin(async {})
             },
@@ -172,9 +186,11 @@ impl VpnPeer {
 
     /// Set up the data channel to forward received packets into packet_tx.
     /// Returns a `Notify` that is triggered when the data channel opens.
+    /// `peer_label` is used in log messages (e.g. "Peer 2 (abc12345…)").
     pub fn setup_data_channel_handler(
         data_channel: &Arc<RTCDataChannel>,
         tx: mpsc::Sender<Vec<u8>>,
+        peer_label: Option<Arc<str>>,
     ) -> Arc<Notify> {
         let open_notify = Arc::new(Notify::new());
 
@@ -183,20 +199,24 @@ impl VpnPeer {
             let tx = tx.clone();
             Box::pin(async move {
                 if let Err(e) = tx.send(msg.data.to_vec()).await {
-                    warn!("Failed to forward packet from data channel: {e}");
+                    warn!("Data channel packet forward failed: {e}");
                 }
             })
         }));
 
         let notify = open_notify.clone();
+        let label_open = peer_label.clone();
         data_channel.on_open(Box::new(move || {
-            info!("Data channel opened - VPN tunnel is active");
+            let peer = label_open.as_deref().unwrap_or("(unknown peer)");
+            info!(peer = %peer, "Tunnel data channel ready — traffic can flow");
             notify.notify_one();
             Box::pin(async {})
         }));
 
-        data_channel.on_close(Box::new(|| {
-            info!("Data channel closed");
+        let label_close = peer_label.clone();
+        data_channel.on_close(Box::new(move || {
+            let peer = label_close.as_deref().unwrap_or("(unknown peer)");
+            info!(peer = %peer, "Tunnel data channel closed");
             Box::pin(async {})
         }));
 

@@ -134,9 +134,9 @@ impl SignalingClient {
         let cipher = PacketCipher::new(shared_key);
 
         info!(
-            broker = format!("{broker_host}:{broker_port}"),
+            broker = %format!("{}:{}", broker_host, broker_port),
             room = %room_id,
-            "Connecting to signaling server"
+            "Signaling: connecting to MQTT broker"
         );
 
         Ok(Self { client, eventloop, room_id, cipher })
@@ -169,7 +169,11 @@ impl SignalingClient {
                     if retries > MAX_RETRIES {
                         anyhow::bail!("Signaling connection failed after {MAX_RETRIES} retries: {e}");
                     }
-                    warn!("Signaling connection error (retry {retries}/{MAX_RETRIES}): {e}");
+                    warn!(
+                        retry = %format!("{}/{}", retries, MAX_RETRIES),
+                        error = %e,
+                        "Signaling: MQTT poll error — retrying"
+                    );
                     tokio::time::sleep(Duration::from_secs(1.min(retries as u64))).await;
                 }
             }
@@ -192,7 +196,11 @@ impl SignalingClient {
                     if retries > MAX_RETRIES {
                         anyhow::bail!("Signaling connection failed after {MAX_RETRIES} retries: {e}");
                     }
-                    warn!("Signaling connection error (retry {retries}/{MAX_RETRIES}): {e}");
+                    warn!(
+                        retry = %format!("{}/{}", retries, MAX_RETRIES),
+                        error = %e,
+                        "Signaling: MQTT poll error — retrying"
+                    );
                     tokio::time::sleep(Duration::from_secs(1.min(retries as u64))).await;
                 }
             }
@@ -211,13 +219,13 @@ impl SignalingClient {
         self.client.publish(&offer_topic, QoS::AtLeastOnce, true, encrypted).await
             .context("Failed to publish offer")?;
 
-        info!("Offer published, waiting for peer answer...");
+        info!("Signaling: offer published — waiting for answer");
 
         let payload = self.recv_on(&answer_topic).await?;
         let decrypted = self.cipher.decrypt(&payload)?;
         let answer = String::from_utf8(decrypted)?;
 
-        info!("Received answer via signaling server");
+        info!("Signaling: answer received");
         Ok(answer)
     }
 
@@ -228,13 +236,13 @@ impl SignalingClient {
         self.client.subscribe(&offer_topic, QoS::AtLeastOnce).await
             .context("Failed to subscribe to offer topic")?;
 
-        info!("Waiting for peer offer...");
+        info!("Signaling: waiting for offer");
 
         let payload = self.recv_on(&offer_topic).await?;
         let decrypted = self.cipher.decrypt(&payload)?;
         let offer = String::from_utf8(decrypted)?;
 
-        info!("Received offer via signaling server");
+        info!("Signaling: offer received");
         Ok(offer)
     }
 
@@ -247,7 +255,7 @@ impl SignalingClient {
             .context("Failed to publish answer")?;
 
         self.flush_pub().await?;
-        info!("Answer published via signaling server");
+        info!("Signaling: answer published");
         Ok(())
     }
 

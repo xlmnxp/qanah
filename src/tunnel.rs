@@ -94,8 +94,14 @@ impl RoutingTable {
     }
 
     pub async fn add_peer(&self, route: PeerRoute) {
-        let ips: Vec<String> = route.allowed_ips.iter().map(|c| c.to_string()).collect();
-        info!(peer_key = %&route.peer_key[..8], allowed_ips = %ips.join(", "), "Peer added to routing table");
+        let key_preview = route.peer_key.chars().take(8).collect::<String>();
+        let routes: Vec<String> = route.allowed_ips.iter().map(|c| c.to_string()).collect();
+        info!(
+            peer = %format!("{}…", key_preview),
+            routes = %routes.join(", "),
+            can_relay = route.can_relay,
+            "Peer connected — added to routing table"
+        );
         self.peers.write().await.push(route);
     }
 
@@ -104,7 +110,11 @@ impl RoutingTable {
         let before = peers.len();
         peers.retain(|p| p.peer_key != peer_key);
         if peers.len() < before {
-            info!(peer_key = %&peer_key[..8], "Peer removed from routing table");
+            let key_preview = peer_key.chars().take(8).collect::<String>();
+            info!(
+                peer = %format!("{}…", key_preview),
+                "Peer disconnected — removed from routing table"
+            );
         }
     }
 
@@ -152,7 +162,7 @@ impl RoutingTable {
         let encrypted = match peer.encrypt_cipher.encrypt(&to_send) {
             Ok(data) => data,
             Err(e) => {
-                error!("Failed to encrypt packet: {e}");
+                error!(dst = %dst, error = %e, "Failed to encrypt packet — dropping");
                 return;
             }
         };
@@ -161,7 +171,7 @@ impl RoutingTable {
             tracing::debug!(dst = %dst, relay_via = %&peer.peer_key[..8], "Relaying packet via peer");
         }
         if let Err(e) = peer.data_channel.send(&packet).await {
-            error!(dst = %dst, "Failed to send packet over data channel: {e}");
+            error!(dst = %dst, error = %e, "Failed to send packet over data channel");
         }
     }
 }
@@ -236,7 +246,11 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
         device.tun_name().context("Failed to get TUN device name")?
     };
 
-    info!(device = %dev_name, mtu = mtu, "TUN device created");
+    info!(
+        device = %dev_name,
+        mtu = mtu,
+        "TUN device created and ready"
+    );
 
     for v4 in ipv4_address.iter().skip(1) {
         add_address_via_ip(&dev_name, v4.addr, v4.prefix)?;
@@ -247,7 +261,7 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     }
 
     for addr in &config.interface.addresses {
-        info!(address = %addr, "Configured address on {}", dev_name);
+        info!(device = %dev_name, address = %addr, "Interface address configured");
     }
 
     disable_rp_filter(&dev_name);
@@ -270,7 +284,7 @@ fn disable_rp_filter(dev_name: &str) {
         "/proc/sys/net/ipv4/conf/all/rp_filter".to_string(),
     ] {
         if std::fs::write(&path, "0").is_ok() {
-            info!("Disabled rp_filter: {path}");
+            tracing::debug!(path = %path, "Disabled reverse path filter");
         }
     }
 }
@@ -284,18 +298,18 @@ fn add_route(dev_name: &str, cidr: &CidrAddress) {
         .output()
     {
         Ok(output) if output.status.success() => {
-            info!(route = %dest, device = %dev_name, "Added route");
+            info!(route = %dest, device = %dev_name, "Route added");
         }
         Ok(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if stderr.contains("File exists") {
-                info!(route = %dest, device = %dev_name, "Route already exists");
+                tracing::debug!(route = %dest, device = %dev_name, "Route already exists");
             } else {
-                warn!("Failed to add route {dest} dev {dev_name}: {}", stderr.trim());
+                warn!(route = %dest, device = %dev_name, error = %stderr.trim(), "Failed to add route");
             }
         }
         Err(e) => {
-            warn!("Failed to run ip route add: {e}");
+            warn!(route = %dest, device = %dev_name, error = %e, "Failed to run ip route add");
         }
     }
 }
@@ -321,7 +335,7 @@ fn add_address_via_ip(dev_name: &str, addr: IpAddr, prefix: u8) -> Result<()> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("File exists") {
-            info!(address = %cidr, device = %dev_name, "Address already assigned");
+            tracing::debug!(address = %cidr, device = %dev_name, "Address already assigned");
             return Ok(());
         }
         anyhow::bail!(
@@ -339,21 +353,21 @@ pub async fn tun_to_peers(
     mut tun_reader: tun::DeviceReader,
     routing_table: Arc<RoutingTable>,
 ) {
-    info!("Starting TUN → WebRTC forwarding");
+    info!("TUN → WebRTC forwarding started (outbound traffic)");
 
     let mut buf = vec![0u8; 65535];
 
     loop {
         match tun_reader.read(&mut buf).await {
             Ok(0) => {
-                info!("TUN device closed");
+                info!("TUN device closed — stopping forwarder");
                 break;
             }
             Ok(n) => {
                 routing_table.route_packet(&buf[..n], true).await;
             }
             Err(e) => {
-                error!("Error reading from TUN: {e}");
+                error!(error = %e, "Error reading from TUN — stopping forwarder");
                 break;
             }
         }
@@ -372,7 +386,7 @@ pub async fn peer_to_tun(
         let plaintext = match cipher.decrypt(&packet) {
             Ok(data) => data,
             Err(e) => {
-                warn!("Failed to decrypt packet: {e}");
+                tracing::debug!(error = %e, "Dropping packet: decrypt failed");
                 continue;
             }
         };
@@ -384,7 +398,7 @@ pub async fn peer_to_tun(
             DecodedPacket::Direct(payload) => {
                 let mut writer = tun_writer.lock().await;
                 if let Err(e) = writer.write_all(payload).await {
-                    error!("Failed to write packet to TUN: {e}");
+                    error!(error = %e, "Failed to write to TUN — stopping receiver");
                     break;
                 }
             }
@@ -395,5 +409,5 @@ pub async fn peer_to_tun(
         }
     }
 
-    info!("Packet receiver closed, stopping TUN writer");
+    info!("Peer packet stream ended — TUN writer stopped");
 }
