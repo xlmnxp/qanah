@@ -3,11 +3,11 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
 use webrtc::data_channel::RTCDataChannel;
 
-use crate::config::WgConfig;
+use crate::config::{CidrAddress, WgConfig};
 use crate::crypto::PacketCipher;
 
 /// Create and configure a TUN device based on the WireGuard config.
@@ -15,13 +15,13 @@ use crate::crypto::PacketCipher;
 pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     let mtu = config.interface.mtu.unwrap_or(1400);
 
-    let ipv4_addrs: Vec<_> = config
+    let ipv4_address: Vec<_> = config
         .interface
         .addresses
         .iter()
         .filter(|a| a.is_ipv4())
         .collect();
-    let ipv6_addrs: Vec<_> = config
+    let ipv6_address: Vec<_> = config
         .interface
         .addresses
         .iter()
@@ -31,7 +31,7 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     let mut tun_config = tun::Configuration::default();
     tun_config.mtu(mtu as u16).up();
 
-    if let Some(v4) = ipv4_addrs.first() {
+    if let Some(v4) = ipv4_address.first() {
         match v4.addr {
             IpAddr::V4(ipv4) => {
                 let netmask = prefix_to_netmask(v4.prefix);
@@ -51,12 +51,12 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     info!(device = %dev_name, mtu = mtu, "TUN device created");
 
     // Add any additional IPv4 addresses beyond the first
-    for v4 in ipv4_addrs.iter().skip(1) {
+    for v4 in ipv4_address.iter().skip(1) {
         add_address_via_ip(&dev_name, v4.addr, v4.prefix)?;
     }
 
     // Add all IPv6 addresses via `ip` (the tun crate only supports IPv4 natively)
-    for v6 in &ipv6_addrs {
+    for v6 in &ipv6_address {
         add_address_via_ip(&dev_name, v6.addr, v6.prefix)?;
     }
 
@@ -64,10 +64,54 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
         info!(address = %addr, "Configured address on {}", dev_name);
     }
 
+    disable_rp_filter(&dev_name);
+
+    for peer in &config.peers {
+        for allowed_ip in &peer.allowed_ips {
+            add_route(&dev_name, allowed_ip);
+        }
+    }
+
     let async_device =
         tun::AsyncDevice::new(device).context("Failed to create async TUN device")?;
 
     Ok(async_device)
+}
+
+fn disable_rp_filter(dev_name: &str) {
+    for path in [
+        format!("/proc/sys/net/ipv4/conf/{dev_name}/rp_filter"),
+        "/proc/sys/net/ipv4/conf/all/rp_filter".to_string(),
+    ] {
+        if std::fs::write(&path, "0").is_ok() {
+            info!("Disabled rp_filter: {path}");
+        }
+    }
+}
+
+fn add_route(dev_name: &str, cidr: &CidrAddress) {
+    let family = if cidr.is_ipv6() { "-6" } else { "-4" };
+    let dest = format!("{}/{}", cidr.addr, cidr.prefix);
+
+    match std::process::Command::new("ip")
+        .args([family, "route", "add", &dest, "dev", dev_name])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            info!(route = %dest, device = %dev_name, "Added route");
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if stderr.contains("File exists") {
+                info!(route = %dest, device = %dev_name, "Route already exists");
+            } else {
+                warn!("Failed to add route {dest} dev {dev_name}: {}", stderr.trim());
+            }
+        }
+        Err(e) => {
+            warn!("Failed to run ip route add: {e}");
+        }
+    }
 }
 
 fn prefix_to_netmask(prefix: u8) -> std::net::Ipv4Addr {
@@ -107,10 +151,14 @@ fn add_address_via_ip(dev_name: &str, addr: IpAddr, prefix: u8) -> Result<()> {
 
 /// Read packets from TUN, encrypt them, and send over the WebRTC data channel.
 pub async fn tun_to_webrtc(
-    mut tun_reader: tokio::io::ReadHalf<tun::AsyncDevice>,
+    mut tun_reader: tun::DeviceReader,
     data_channel: Arc<RTCDataChannel>,
     cipher: PacketCipher,
+    dc_open: Arc<Notify>,
 ) {
+    dc_open.notified().await;
+    info!("Data channel ready, starting TUN → WebRTC forwarding");
+
     let mut buf = vec![0u8; 65535];
 
     loop {
@@ -143,7 +191,7 @@ pub async fn tun_to_webrtc(
 
 /// Receive encrypted packets from WebRTC data channel, decrypt, and write to TUN.
 pub async fn webrtc_to_tun(
-    mut tun_writer: tokio::io::WriteHalf<tun::AsyncDevice>,
+    mut tun_writer: tun::DeviceWriter,
     mut packet_rx: mpsc::Receiver<Vec<u8>>,
     cipher: PacketCipher,
 ) {

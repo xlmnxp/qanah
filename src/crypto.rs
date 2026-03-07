@@ -2,8 +2,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
+use base64::engine::DecodePaddingMode;
+use base64::{alphabet, Engine};
 use chacha20poly1305::aead::{Aead, KeyInit};
+
+const BASE64_DECODE: GeneralPurpose = GeneralPurpose::new(
+    &alphabet::STANDARD,
+    GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+);
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -13,13 +20,13 @@ const TAG_LEN: usize = 16;
 /// Derives a ChaCha20-Poly1305 shared key from a WireGuard private key
 /// and a peer's public key via X25519 Diffie-Hellman.
 pub fn derive_shared_key(private_key_b64: &str, public_key_b64: &str) -> Result<[u8; 32]> {
-    let priv_bytes: [u8; 32] = BASE64
+    let priv_bytes: [u8; 32] = BASE64_DECODE
         .decode(private_key_b64.trim())
         .context("Invalid base64 in PrivateKey")?
         .try_into()
         .map_err(|v: Vec<u8>| anyhow::anyhow!("PrivateKey must be 32 bytes, got {}", v.len()))?;
 
-    let pub_bytes: [u8; 32] = BASE64
+    let pub_bytes: [u8; 32] = BASE64_DECODE
         .decode(public_key_b64.trim())
         .context("Invalid base64 in PublicKey")?
         .try_into()
@@ -150,10 +157,10 @@ mod tests {
         let pub_a = PublicKey::from(&secret_a);
         let pub_b = PublicKey::from(&secret_b);
 
-        let pub_a_b64 = BASE64.encode(pub_a.as_bytes());
-        let pub_b_b64 = BASE64.encode(pub_b.as_bytes());
-        let priv_a_b64 = BASE64.encode(priv_a);
-        let priv_b_b64 = BASE64.encode(priv_b);
+        let pub_a_b64 = base64::engine::general_purpose::STANDARD.encode(pub_a.as_bytes());
+        let pub_b_b64 = base64::engine::general_purpose::STANDARD.encode(pub_b.as_bytes());
+        let priv_a_b64 = base64::engine::general_purpose::STANDARD.encode(priv_a);
+        let priv_b_b64 = base64::engine::general_purpose::STANDARD.encode(priv_b);
 
         let shared_ab = derive_shared_key(&priv_a_b64, &pub_b_b64).unwrap();
         let shared_ba = derive_shared_key(&priv_b_b64, &pub_a_b64).unwrap();

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::{error, info, warn};
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::MediaEngine;
@@ -152,10 +152,13 @@ impl VpnPeer {
     }
 
     /// Set up the data channel to forward received packets into packet_tx.
+    /// Returns a `Notify` that is triggered when the data channel opens.
     pub fn setup_data_channel_handler(
         data_channel: &Arc<RTCDataChannel>,
         tx: mpsc::Sender<Vec<u8>>,
-    ) {
+    ) -> Arc<Notify> {
+        let open_notify = Arc::new(Notify::new());
+
         let tx = tx.clone();
         data_channel.on_message(Box::new(move |msg: DataChannelMessage| {
             let tx = tx.clone();
@@ -166,8 +169,10 @@ impl VpnPeer {
             })
         }));
 
-        data_channel.on_open(Box::new(|| {
+        let notify = open_notify.clone();
+        data_channel.on_open(Box::new(move || {
             info!("Data channel opened - VPN tunnel is active");
+            notify.notify_one();
             Box::pin(async {})
         }));
 
@@ -175,5 +180,7 @@ impl VpnPeer {
             info!("Data channel closed");
             Box::pin(async {})
         }));
+
+        open_notify
     }
 }

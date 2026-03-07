@@ -4,13 +4,13 @@ mod peer;
 mod signaling;
 mod tunnel;
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Read, Write};
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use tokio::io::split;
 use tracing::info;
 use webrtc::data_channel::RTCDataChannel;
 
@@ -111,7 +111,7 @@ async fn run_offer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher)
     println!("{offer_encoded}");
     println!("===== END OFFER =====\n");
 
-    let answer_encoded = prompt("Paste the ANSWER from the remote peer: ")?;
+    let answer_encoded = read_signal("Paste the ANSWER from the remote peer: ")?;
     vpn_peer.apply_answer(&answer_encoded).await?;
 
     info!("Answer applied, waiting for connection...");
@@ -120,7 +120,7 @@ async fn run_offer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher)
 }
 
 async fn run_answer(vpn_peer: VpnPeer, wg_config: WgConfig, cipher: PacketCipher) -> Result<()> {
-    let offer_encoded = prompt("Paste the OFFER from the remote peer: ")?;
+    let offer_encoded = read_signal("Paste the OFFER from the remote peer: ")?;
 
     let (dc_tx, mut dc_rx) = tokio::sync::mpsc::channel::<Arc<RTCDataChannel>>(1);
 
@@ -156,18 +156,20 @@ async fn start_tunnel(
     wg_config: WgConfig,
     cipher: PacketCipher,
 ) -> Result<()> {
-    VpnPeer::setup_data_channel_handler(&data_channel, vpn_peer.packet_tx.clone());
+    let dc_open = VpnPeer::setup_data_channel_handler(&data_channel, vpn_peer.packet_tx.clone());
 
     info!("Creating TUN device...");
     let tun_dev = tunnel::create_tun_device(&wg_config)?;
-    let (tun_reader, tun_writer) = split(tun_dev);
+    let (tun_writer, tun_reader) = tun_dev
+        .split()
+        .map_err(|e| anyhow::anyhow!("Failed to split TUN device: {e}"))?;
 
     info!("VPN tunnel active (encrypted with ChaCha20-Poly1305). Press Ctrl+C to stop.");
 
     let dc = data_channel.clone();
     let encrypt_cipher = cipher.clone();
     let tun_to_dc = tokio::spawn(async move {
-        tunnel::tun_to_webrtc(tun_reader, dc, encrypt_cipher).await;
+        tunnel::tun_to_webrtc(tun_reader, dc, encrypt_cipher, dc_open).await;
     });
 
     let decrypt_cipher = cipher;
@@ -187,10 +189,51 @@ async fn start_tunnel(
     Ok(())
 }
 
-fn prompt(msg: &str) -> Result<String> {
+/// Reads a base64-encoded signal message from stdin using non-canonical
+/// (raw) terminal mode to bypass the Linux N_TTY 4096-byte buffer limit
+/// that silently discards characters on long pastes.
+fn read_signal(msg: &str) -> Result<String> {
     print!("{msg}");
     io::stdout().flush()?;
-    let mut line = String::new();
-    io::stdin().lock().read_line(&mut line)?;
-    Ok(line.trim().to_string())
+
+    let fd = io::stdin().as_raw_fd();
+    let mut original_termios: libc::termios = unsafe { std::mem::zeroed() };
+    let is_tty = unsafe { libc::tcgetattr(fd, &mut original_termios) } == 0;
+
+    if is_tty {
+        let mut raw = original_termios;
+        raw.c_lflag &= !(libc::ICANON | libc::ECHO);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) };
+    }
+
+    let result = read_until_newline();
+
+    if is_tty {
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original_termios) };
+        eprintln!();
+    }
+
+    result
+}
+
+fn read_until_newline() -> Result<String> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    let mut stdin = io::stdin().lock();
+
+    loop {
+        match stdin.read(&mut byte)? {
+            0 => break,
+            _ => {
+                if byte[0] == b'\n' || byte[0] == b'\r' {
+                    break;
+                }
+                buf.push(byte[0]);
+            }
+        }
+    }
+
+    Ok(String::from_utf8(buf)?.trim().to_string())
 }
