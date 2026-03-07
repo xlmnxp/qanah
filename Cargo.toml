@@ -3,6 +3,11 @@ name = "qanah"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-2.0-or-later"
+description = "A WebRTC-based VPN that uses WireGuard configuration files, secured with ChaCha20-Poly1305 and X25519 key exchange"
+repository = "https://github.com/xlmnxp/qanah"
+homepage = "https://github.com/xlmnxp/qanah"
+keywords = ["vpn", "webrtc", "wireguard", "tunnel", "p2p"]
+categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
