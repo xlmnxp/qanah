@@ -202,7 +202,7 @@ async fn peer_connection_loop(
             &signal_server,
             stun_urls.as_deref().cloned(),
             turn_config.as_deref(),
-            &routing_table,
+            routing_table.clone(),
             tun_writer.clone(),
         )
         .await
@@ -246,7 +246,7 @@ async fn connect_peer(
     signal_server: &str,
     stun_urls: Option<Vec<String>>,
     turn_config: Option<&TurnConfig>,
-    routing_table: &RoutingTable,
+    routing_table: Arc<RoutingTable>,
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
 ) -> Result<()> {
     let is_offerer = match manual_mode {
@@ -287,16 +287,18 @@ async fn connect_peer(
         .add_peer(PeerRoute {
             peer_key: peer_public_key.to_string(),
             allowed_ips,
+            can_relay: true,
             data_channel: data_channel.clone(),
             encrypt_cipher,
         })
         .await;
 
     let disconnected = vpn_peer.disconnected.clone();
+    let routing_table_recv = routing_table.clone();
 
     // Run the receive loop (peer → TUN) until the peer disconnects
     let recv_task = tokio::spawn(async move {
-        tunnel::peer_to_tun(tun_writer, vpn_peer.packet_rx, decrypt_cipher).await;
+        tunnel::peer_to_tun(tun_writer, vpn_peer.packet_rx, decrypt_cipher, routing_table_recv).await;
     });
 
     // Wait for the WebRTC connection to drop

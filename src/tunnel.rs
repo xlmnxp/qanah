@@ -10,10 +10,72 @@ use webrtc::data_channel::RTCDataChannel;
 use crate::config::{CidrAddress, WgConfig};
 use crate::crypto::PacketCipher;
 
+// Relay envelope: first byte 0x01 = relay, then 1 byte addr family (4 or 6), then 4 or 16 bytes dst IP, then inner packet.
+// Any other first byte (e.g. 0x45 IPv4, 0x60 IPv6) = direct IP packet.
+const RELAY_TYPE_RELAY: u8 = 0x01;
+const ADDR_FAMILY_IPV4: u8 = 4;
+const ADDR_FAMILY_IPV6: u8 = 6;
+
+/// Encodes a relay envelope: type byte, addr family, dst IP bytes, then inner packet.
+pub fn encode_relay_envelope(dst: IpAddr, inner: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + 16 + inner.len());
+    out.push(RELAY_TYPE_RELAY);
+    match dst {
+        IpAddr::V4(ip) => {
+            out.push(ADDR_FAMILY_IPV4);
+            out.extend_from_slice(&ip.octets());
+        }
+        IpAddr::V6(ip) => {
+            out.push(ADDR_FAMILY_IPV6);
+            out.extend_from_slice(&ip.octets());
+        }
+    }
+    out.extend_from_slice(inner);
+    out
+}
+
+/// Decoded packet: either a direct IP packet or a relay envelope (final_dst, inner payload).
+#[derive(Debug)]
+pub enum DecodedPacket<'a> {
+    Direct(&'a [u8]),
+    Relay(IpAddr, &'a [u8]),
+}
+
+/// If the decrypted payload starts with RELAY_TYPE_RELAY, parse envelope and return Relay(dst, inner).
+/// Otherwise return Direct(whole payload).
+pub fn decode_packet(pkt: &[u8]) -> Option<DecodedPacket<'_>> {
+    if pkt.is_empty() {
+        return None;
+    }
+    if pkt[0] != RELAY_TYPE_RELAY {
+        return Some(DecodedPacket::Direct(pkt));
+    }
+    if pkt.len() < 2 {
+        return None;
+    }
+    let family = pkt[1];
+    let (dst, inner_start) = match family {
+        ADDR_FAMILY_IPV4 if pkt.len() >= 2 + 4 => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&pkt[2..6]);
+            (IpAddr::V4(Ipv4Addr::from(octets)), 6)
+        }
+        ADDR_FAMILY_IPV6 if pkt.len() >= 2 + 16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&pkt[2..18]);
+            (IpAddr::V6(Ipv6Addr::from(octets)), 18)
+        }
+        _ => return None,
+    };
+    Some(DecodedPacket::Relay(dst, &pkt[inner_start..]))
+}
+
 /// A single peer's data channel + encrypt cipher for outbound routing.
 pub struct PeerRoute {
     pub peer_key: String,
     pub allowed_ips: Vec<CidrAddress>,
+    /// When true, this peer can be used to relay packets when no direct route exists.
+    pub can_relay: bool,
     pub data_channel: Arc<RTCDataChannel>,
     pub encrypt_cipher: PacketCipher,
 }
@@ -47,8 +109,10 @@ impl RoutingTable {
     }
 
     /// Find the peer whose AllowedIPs match the given destination IP (longest-prefix match)
-    /// and send the encrypted packet through its data channel.
-    pub async fn route_packet(&self, pkt: &[u8]) {
+    /// and send the encrypted packet through its data channel. If no direct route exists and
+    /// `allow_relay` is true, send the packet to the first relay-capable peer wrapped in a
+    /// relay envelope.
+    pub async fn route_packet(&self, pkt: &[u8], allow_relay: bool) {
         let dst = match packet_dst_ip(pkt) {
             Some(ip) => ip,
             None => return,
@@ -68,13 +132,24 @@ impl RoutingTable {
             }
         }
 
-        let idx = match best {
-            Some((_, i)) => i,
+        let (peer_idx, to_send, is_relay) = match best {
+            Some((_, i)) => (i, pkt.to_vec(), false),
+            None if allow_relay => {
+                // No direct route: try relaying via first peer that can relay
+                let relay_idx = peers.iter().position(|p| p.can_relay);
+                match relay_idx {
+                    Some(i) => {
+                        let envelope = encode_relay_envelope(dst, pkt);
+                        (i, envelope, true)
+                    }
+                    None => return,
+                }
+            }
             None => return,
         };
 
-        let peer = &peers[idx];
-        let encrypted = match peer.encrypt_cipher.encrypt(pkt) {
+        let peer = &peers[peer_idx];
+        let encrypted = match peer.encrypt_cipher.encrypt(&to_send) {
             Ok(data) => data,
             Err(e) => {
                 error!("Failed to encrypt packet: {e}");
@@ -82,6 +157,9 @@ impl RoutingTable {
             }
         };
         let packet = bytes::Bytes::from(encrypted);
+        if is_relay {
+            tracing::debug!(dst = %dst, relay_via = %&peer.peer_key[..8], "Relaying packet via peer");
+        }
         if let Err(e) = peer.data_channel.send(&packet).await {
             error!(dst = %dst, "Failed to send packet over data channel: {e}");
         }
@@ -272,7 +350,7 @@ pub async fn tun_to_peers(
                 break;
             }
             Ok(n) => {
-                routing_table.route_packet(&buf[..n]).await;
+                routing_table.route_packet(&buf[..n], true).await;
             }
             Err(e) => {
                 error!("Error reading from TUN: {e}");
@@ -283,11 +361,12 @@ pub async fn tun_to_peers(
 }
 
 /// Receive encrypted packets from a single peer's WebRTC data channel,
-/// decrypt, and write to the shared TUN device.
+/// decrypt, and either write to TUN (direct) or forward via routing table (relay).
 pub async fn peer_to_tun(
     tun_writer: Arc<Mutex<tun::DeviceWriter>>,
     mut packet_rx: mpsc::Receiver<Vec<u8>>,
     cipher: PacketCipher,
+    routing_table: Arc<RoutingTable>,
 ) {
     while let Some(packet) = packet_rx.recv().await {
         let plaintext = match cipher.decrypt(&packet) {
@@ -297,10 +376,22 @@ pub async fn peer_to_tun(
                 continue;
             }
         };
-        let mut writer = tun_writer.lock().await;
-        if let Err(e) = writer.write_all(&plaintext).await {
-            error!("Failed to write packet to TUN: {e}");
-            break;
+        let decoded = match decode_packet(&plaintext) {
+            Some(d) => d,
+            None => continue,
+        };
+        match decoded {
+            DecodedPacket::Direct(payload) => {
+                let mut writer = tun_writer.lock().await;
+                if let Err(e) = writer.write_all(payload).await {
+                    error!("Failed to write packet to TUN: {e}");
+                    break;
+                }
+            }
+            DecodedPacket::Relay(_dst, inner) => {
+                // Forward without allowing further relay to avoid loops
+                routing_table.route_packet(inner, false).await;
+            }
         }
     }
 
