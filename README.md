@@ -6,6 +6,8 @@ A peer-to-peer VPN that uses WireGuard configuration files and establishes encry
 
 Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP or port forwarding.
 
+Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration.
+
 ## Building
 
 ```bash
@@ -14,35 +16,40 @@ cargo build --release
 
 ## Usage
 
-Both peers need a WireGuard-style config file. The `[Interface]` section provides the local address and keys, while the `[Peer]` section provides the remote peer's public key and allowed IPs.
+Each peer needs a WireGuard-style config file. The `[Interface]` section provides the local address and keys, while the `[Peer]` sections provide the remote peers' public keys and allowed IPs.
 
-By default, Qanah uses an MQTT broker to automatically exchange WebRTC signaling data (offer/answer), so both peers just run one command each and the connection is established.
+By default, Qanah uses an MQTT broker to automatically exchange WebRTC signaling data (offer/answer), so peers just run one command each and connections are established automatically.
 
-### Peer 1 (Initiator)
-
-```bash
-sudo ./target/release/qanah --config examples/peer1.conf offer
-```
-
-### Peer 2 (Responder)
-
-```bash
-sudo ./target/release/qanah --config examples/peer2.conf answer
-```
-
-The peers discover each other via the MQTT signaling server and establish a direct WebRTC connection automatically.
-
-### Manual Signaling
-
-If you prefer to exchange signaling data manually (copy-paste), use the `--manual` flag:
+### Automatic Signaling (Default)
 
 ```bash
 # Peer 1
-sudo ./target/release/qanah --config examples/peer1.conf --manual offer
-# Copy the printed OFFER and send it to Peer 2
+sudo ./target/release/qanah --config examples/peer1.conf
 
 # Peer 2
-sudo ./target/release/qanah --config examples/peer2.conf --manual answer
+sudo ./target/release/qanah --config examples/peer2.conf
+
+# Peer 3
+sudo ./target/release/qanah --config examples/peer3.conf
+```
+
+The peers discover each other via the MQTT signaling server and establish direct WebRTC connections automatically.
+
+### Manual Signaling
+
+If you prefer to exchange signaling data manually (copy-paste), use the subcommands:
+
+```bash
+# Peer 1 (Initiator)
+sudo ./target/release/qanah --config examples/peer1.conf offer
+# Copy the printed OFFER and send it to other peers
+
+# Peer 2 (Responder)
+sudo ./target/release/qanah --config examples/peer2.conf answer
+# Paste the OFFER, then copy the printed ANSWER and send it back to Peer 1
+
+# Peer 3 (Responder)
+sudo ./target/release/qanah --config examples/peer3.conf answer
 # Paste the OFFER, then copy the printed ANSWER and send it back to Peer 1
 ```
 
@@ -61,15 +68,15 @@ ping6 fd00::1   # from Peer 2
 ## CLI Options
 
 ```
-qanah [OPTIONS] --config <CONFIG> <COMMAND>
+qanah [OPTIONS] --config <CONFIG> [COMMAND]
 ```
 
 ### Commands
 
 | Command | Description |
 |---------|-------------|
-| `offer` | Start as the offering peer (initiator) |
-| `answer` | Start as the answering peer (responder) |
+| `offer` | Start as the offering peer (initiator) — enables manual signaling |
+| `answer` | Start as the answering peer (responder) — enables manual signaling |
 
 ### Options
 
@@ -80,33 +87,29 @@ qanah [OPTIONS] --config <CONFIG> <COMMAND>
 | `--turn-url <URL>` | TURN server URL (e.g. `turn:turn.example.com:3478`) | *(none)* |
 | `--turn-username <USERNAME>` | TURN server username (requires `--turn-url`) | *(none)* |
 | `--turn-credential <CREDENTIAL>` | TURN server credential (requires `--turn-url`) | *(none)* |
-| `--signal-server <HOST:PORT>` | MQTT signaling server for automatic SDP exchange | `broker.hivemq.com:1883` |
-| `--manual` | Use manual copy-paste signaling instead of MQTT | `false` |
+| `--signal-server <HOST:PORT>` | MQTT signaling server for automatic SDP exchange | `broker.emqx.io:1883` |
 | `-h, --help` | Print help | |
 
 ### Examples
 
 ```bash
 # Basic usage with defaults
-sudo ./target/release/qanah -c peer1.conf offer
+sudo ./target/release/qanah -c peer1.conf
 
 # Custom STUN servers
 sudo ./target/release/qanah -c peer1.conf \
   --stun stun:stun.example.com:3478 \
-  --stun stun:stun2.example.com:19302 \
-  offer
+  --stun stun:stun2.example.com:19302
 
 # With TURN relay
 sudo ./target/release/qanah -c peer1.conf \
   --turn-url turn:turn.example.com:3478 \
   --turn-username myuser \
   --turn-credential mypassword \
-  offer
 
 # Custom MQTT signaling server
 sudo ./target/release/qanah -c peer1.conf \
   --signal-server mqtt.example.com:1883 \
-  offer
 
 # Manual signaling with custom STUN and TURN
 sudo ./target/release/qanah -c peer1.conf \
@@ -116,6 +119,14 @@ sudo ./target/release/qanah -c peer1.conf \
   --turn-credential pass \
   --manual \
   offer
+
+sudo ./target/release/qanah -c peer1.conf \
+  --stun stun:mystun.io:3478 \
+  --turn-url turn:myturn.io:3478 \
+  --turn-username user \
+  --turn-credential pass \
+  --manual \
+  answer
 ```
 
 ## How It Works
@@ -160,10 +171,5 @@ PublicKey = <base64-encoded-x25519-public-key>
 AllowedIPs = 10.0.0.2/32, fd00::2/128
 ```
 
-## Logging
-
-Set the `RUST_LOG` environment variable for more verbose output:
-
-```bash
-RUST_LOG=qanah=debug sudo -E ./target/release/qanah --config peer.conf offer
-```
+## License
+GPLv2 License. See [LICENSE](LICENSE) for details.
