@@ -1,17 +1,127 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 use webrtc::data_channel::RTCDataChannel;
 
 use crate::config::{CidrAddress, WgConfig};
 use crate::crypto::PacketCipher;
 
+/// A single peer's data channel + encrypt cipher for outbound routing.
+pub struct PeerRoute {
+    pub peer_key: String,
+    pub allowed_ips: Vec<CidrAddress>,
+    pub data_channel: Arc<RTCDataChannel>,
+    pub encrypt_cipher: PacketCipher,
+}
+
+/// Dynamic routing table that maps destination IPs to the correct peer.
+/// Peers are added/removed at runtime as they connect/disconnect.
+pub struct RoutingTable {
+    peers: RwLock<Vec<PeerRoute>>,
+}
+
+impl RoutingTable {
+    pub fn new() -> Self {
+        Self {
+            peers: RwLock::new(Vec::new()),
+        }
+    }
+
+    pub async fn add_peer(&self, route: PeerRoute) {
+        let ips: Vec<String> = route.allowed_ips.iter().map(|c| c.to_string()).collect();
+        info!(peer_key = %&route.peer_key[..8], allowed_ips = %ips.join(", "), "Peer added to routing table");
+        self.peers.write().await.push(route);
+    }
+
+    pub async fn remove_peer(&self, peer_key: &str) {
+        let mut peers = self.peers.write().await;
+        let before = peers.len();
+        peers.retain(|p| p.peer_key != peer_key);
+        if peers.len() < before {
+            info!(peer_key = %&peer_key[..8], "Peer removed from routing table");
+        }
+    }
+
+    /// Find the peer whose AllowedIPs match the given destination IP (longest-prefix match)
+    /// and send the encrypted packet through its data channel.
+    pub async fn route_packet(&self, pkt: &[u8]) {
+        let dst = match packet_dst_ip(pkt) {
+            Some(ip) => ip,
+            None => return,
+        };
+
+        let peers = self.peers.read().await;
+
+        let mut best: Option<(u8, usize)> = None;
+        for (i, peer) in peers.iter().enumerate() {
+            for cidr in &peer.allowed_ips {
+                if cidr_contains(cidr, dst) {
+                    match best {
+                        Some((best_prefix, _)) if cidr.prefix <= best_prefix => {}
+                        _ => best = Some((cidr.prefix, i)),
+                    }
+                }
+            }
+        }
+
+        let idx = match best {
+            Some((_, i)) => i,
+            None => return,
+        };
+
+        let peer = &peers[idx];
+        let encrypted = match peer.encrypt_cipher.encrypt(pkt) {
+            Ok(data) => data,
+            Err(e) => {
+                error!("Failed to encrypt packet: {e}");
+                return;
+            }
+        };
+        let packet = bytes::Bytes::from(encrypted);
+        if let Err(e) = peer.data_channel.send(&packet).await {
+            error!(dst = %dst, "Failed to send packet over data channel: {e}");
+        }
+    }
+}
+
+fn cidr_contains(cidr: &CidrAddress, addr: IpAddr) -> bool {
+    match (cidr.addr, addr) {
+        (IpAddr::V4(net), IpAddr::V4(ip)) => {
+            let mask = if cidr.prefix == 0 { 0u32 } else { !0u32 << (32 - cidr.prefix) };
+            u32::from(net) & mask == u32::from(ip) & mask
+        }
+        (IpAddr::V6(net), IpAddr::V6(ip)) => {
+            let mask = if cidr.prefix == 0 { 0u128 } else { !0u128 << (128 - cidr.prefix) };
+            u128::from(net) & mask == u128::from(ip) & mask
+        }
+        _ => false,
+    }
+}
+
+fn packet_dst_ip(pkt: &[u8]) -> Option<IpAddr> {
+    if pkt.is_empty() {
+        return None;
+    }
+    let version = pkt[0] >> 4;
+    match version {
+        4 if pkt.len() >= 20 => {
+            let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+            Some(IpAddr::V4(dst))
+        }
+        6 if pkt.len() >= 40 => {
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&pkt[24..40]);
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
+}
+
 /// Create and configure a TUN device based on the WireGuard config.
-/// Supports IPv4, IPv6, and dual-stack addresses.
 pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     let mtu = config.interface.mtu.unwrap_or(1400);
 
@@ -50,12 +160,10 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
 
     info!(device = %dev_name, mtu = mtu, "TUN device created");
 
-    // Add any additional IPv4 addresses beyond the first
     for v4 in ipv4_address.iter().skip(1) {
         add_address_via_ip(&dev_name, v4.addr, v4.prefix)?;
     }
 
-    // Add all IPv6 addresses via `ip` (the tun crate only supports IPv4 natively)
     for v6 in &ipv6_address {
         add_address_via_ip(&dev_name, v6.addr, v6.prefix)?;
     }
@@ -123,7 +231,6 @@ fn prefix_to_netmask(prefix: u8) -> std::net::Ipv4Addr {
     std::net::Ipv4Addr::from(mask)
 }
 
-/// Add an IP address to a network device using the `ip` command.
 fn add_address_via_ip(dev_name: &str, addr: IpAddr, prefix: u8) -> Result<()> {
     let family = if addr.is_ipv6() { "-6" } else { "-4" };
     let cidr = format!("{addr}/{prefix}");
@@ -135,7 +242,6 @@ fn add_address_via_ip(dev_name: &str, addr: IpAddr, prefix: u8) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        // "RTNETLINK answers: File exists" means the address is already assigned
         if stderr.contains("File exists") {
             info!(address = %cidr, device = %dev_name, "Address already assigned");
             return Ok(());
@@ -149,15 +255,13 @@ fn add_address_via_ip(dev_name: &str, addr: IpAddr, prefix: u8) -> Result<()> {
     Ok(())
 }
 
-/// Read packets from TUN, encrypt them, and send over the WebRTC data channel.
-pub async fn tun_to_webrtc(
+/// Read packets from TUN and route each to the correct peer via the routing table.
+/// Starts immediately — packets to peers not yet connected are silently dropped.
+pub async fn tun_to_peers(
     mut tun_reader: tun::DeviceReader,
-    data_channel: Arc<RTCDataChannel>,
-    cipher: PacketCipher,
-    dc_open: Arc<Notify>,
+    routing_table: Arc<RoutingTable>,
 ) {
-    dc_open.notified().await;
-    info!("Data channel ready, starting TUN → WebRTC forwarding");
+    info!("Starting TUN → WebRTC forwarding");
 
     let mut buf = vec![0u8; 65535];
 
@@ -168,18 +272,7 @@ pub async fn tun_to_webrtc(
                 break;
             }
             Ok(n) => {
-                let encrypted = match cipher.encrypt(&buf[..n]) {
-                    Ok(data) => data,
-                    Err(e) => {
-                        error!("Failed to encrypt packet: {e}");
-                        continue;
-                    }
-                };
-                let packet = bytes::Bytes::from(encrypted);
-                if let Err(e) = data_channel.send(&packet).await {
-                    error!("Failed to send packet over data channel: {e}");
-                    break;
-                }
+                routing_table.route_packet(&buf[..n]).await;
             }
             Err(e) => {
                 error!("Error reading from TUN: {e}");
@@ -189,9 +282,10 @@ pub async fn tun_to_webrtc(
     }
 }
 
-/// Receive encrypted packets from WebRTC data channel, decrypt, and write to TUN.
-pub async fn webrtc_to_tun(
-    mut tun_writer: tun::DeviceWriter,
+/// Receive encrypted packets from a single peer's WebRTC data channel,
+/// decrypt, and write to the shared TUN device.
+pub async fn peer_to_tun(
+    tun_writer: Arc<Mutex<tun::DeviceWriter>>,
     mut packet_rx: mpsc::Receiver<Vec<u8>>,
     cipher: PacketCipher,
 ) {
@@ -203,7 +297,8 @@ pub async fn webrtc_to_tun(
                 continue;
             }
         };
-        if let Err(e) = tun_writer.write_all(&plaintext).await {
+        let mut writer = tun_writer.lock().await;
+        if let Err(e) = writer.write_all(&plaintext).await {
             error!("Failed to write packet to TUN: {e}");
             break;
         }

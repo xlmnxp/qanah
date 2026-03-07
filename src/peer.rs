@@ -26,10 +26,12 @@ pub struct VpnPeer {
     pub peer_connection: Arc<RTCPeerConnection>,
     pub packet_tx: mpsc::Sender<Vec<u8>>,
     pub packet_rx: mpsc::Receiver<Vec<u8>>,
+    /// Notified when the peer connection enters Disconnected, Failed, or Closed state.
+    pub disconnected: Arc<Notify>,
 }
 
 impl VpnPeer {
-    pub async fn new(stun_urls: Option<Vec<String>>, turn: Option<TurnConfig>) -> Result<Self> {
+    pub async fn new(stun_urls: Option<Vec<String>>, turn: Option<&TurnConfig>) -> Result<Self> {
         let mut media_engine = MediaEngine::default();
         media_engine.register_default_codecs()?;
 
@@ -58,9 +60,9 @@ impl VpnPeer {
 
         if let Some(turn) = turn {
             ice_servers.push(RTCIceServer {
-                urls: vec![turn.url],
-                username: turn.username,
-                credential: turn.credential,
+                urls: vec![turn.url.clone()],
+                username: turn.username.clone(),
+                credential: turn.credential.clone(),
                 ..Default::default()
             });
         }
@@ -72,13 +74,25 @@ impl VpnPeer {
 
         let peer_connection = Arc::new(api.new_peer_connection(config).await?);
 
+        let disconnected = Arc::new(Notify::new());
+        let disconnect_notify = disconnected.clone();
+
         peer_connection.on_peer_connection_state_change(Box::new(
             move |state: RTCPeerConnectionState| {
                 match state {
                     RTCPeerConnectionState::Connected => info!("Peer connected!"),
-                    RTCPeerConnectionState::Disconnected => warn!("Peer disconnected"),
-                    RTCPeerConnectionState::Failed => error!("Peer connection failed"),
-                    RTCPeerConnectionState::Closed => info!("Peer connection closed"),
+                    RTCPeerConnectionState::Disconnected => {
+                        warn!("Peer disconnected");
+                        disconnect_notify.notify_one();
+                    }
+                    RTCPeerConnectionState::Failed => {
+                        error!("Peer connection failed");
+                        disconnect_notify.notify_one();
+                    }
+                    RTCPeerConnectionState::Closed => {
+                        info!("Peer connection closed");
+                        disconnect_notify.notify_one();
+                    }
                     _ => info!("Peer connection state: {state}"),
                 }
                 Box::pin(async {})
@@ -91,6 +105,7 @@ impl VpnPeer {
             peer_connection,
             packet_tx,
             packet_rx,
+            disconnected,
         })
     }
 

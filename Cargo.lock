@@ -1597,6 +1597,7 @@ dependencies = [
  "chacha20poly1305",
  "clap",
  "flate2",
+ "futures",
  "libc",
  "rumqttc",
  "serde",

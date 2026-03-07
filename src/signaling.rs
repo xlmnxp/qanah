@@ -11,10 +11,12 @@ use flate2::Compression;
 use rumqttc::{AsyncClient, EventLoop, MqttOptions, QoS, Event, Packet};
 use serde::{Deserialize, Serialize};
 use sha2::{Sha256, Digest};
-use tracing::info;
+use tracing::{info, warn};
 use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
 
 use crate::crypto::PacketCipher;
+
+const MAX_RETRIES: u32 = 10;
 
 const BASE64_ENCODE: GeneralPurpose = general_purpose::STANDARD;
 const BASE64_DECODE: GeneralPurpose = GeneralPurpose::new(
@@ -110,10 +112,14 @@ pub struct SignalingClient {
 
 impl SignalingClient {
     pub fn new(shared_key: &[u8; 32], broker_host: &str, broker_port: u16) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
         let room_id = derive_room_id(shared_key);
         let client_id = format!(
-            "qanah-{}-{}",
+            "qanah-{}-{}-{}",
             std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -144,14 +150,27 @@ impl SignalingClient {
         format!("qanah/{}/answer", self.room_id)
     }
 
-    /// Poll the MQTT event loop, returning the next incoming Publish on `topic`.
+    /// Poll the MQTT event loop until we get an incoming Publish on `topic`.
+    /// Retries through transient connection errors (rumqttc reconnects automatically).
     async fn recv_on(&mut self, topic: &str) -> Result<Vec<u8>> {
+        let mut retries = 0u32;
         loop {
-            let event = self.eventloop.poll().await
-                .map_err(|e| anyhow::anyhow!("Signaling connection error: {e}"))?;
-            if let Event::Incoming(Packet::Publish(p)) = event {
-                if p.topic == topic {
-                    return Ok(p.payload.to_vec());
+            match self.eventloop.poll().await {
+                Ok(event) => {
+                    retries = 0;
+                    if let Event::Incoming(Packet::Publish(p)) = event {
+                        if p.topic == topic {
+                            return Ok(p.payload.to_vec());
+                        }
+                    }
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        anyhow::bail!("Signaling connection failed after {MAX_RETRIES} retries: {e}");
+                    }
+                    warn!("Signaling connection error (retry {retries}/{MAX_RETRIES}): {e}");
+                    tokio::time::sleep(Duration::from_secs(1.min(retries as u64))).await;
                 }
             }
         }
@@ -159,11 +178,23 @@ impl SignalingClient {
 
     /// Ensure at least one outgoing publish is acknowledged.
     async fn flush_pub(&mut self) -> Result<()> {
+        let mut retries = 0u32;
         loop {
-            let event = self.eventloop.poll().await
-                .map_err(|e| anyhow::anyhow!("Signaling connection error: {e}"))?;
-            if let Event::Incoming(Packet::PubAck(_)) = event {
-                return Ok(());
+            match self.eventloop.poll().await {
+                Ok(event) => {
+                    retries = 0;
+                    if let Event::Incoming(Packet::PubAck(_)) = event {
+                        return Ok(());
+                    }
+                }
+                Err(e) => {
+                    retries += 1;
+                    if retries > MAX_RETRIES {
+                        anyhow::bail!("Signaling connection failed after {MAX_RETRIES} retries: {e}");
+                    }
+                    warn!("Signaling connection error (retry {retries}/{MAX_RETRIES}): {e}");
+                    tokio::time::sleep(Duration::from_secs(1.min(retries as u64))).await;
+                }
             }
         }
     }

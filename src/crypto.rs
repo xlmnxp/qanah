@@ -18,6 +18,18 @@ use x25519_dalek::{PublicKey, StaticSecret};
 const NONCE_LEN: usize = 12;
 const TAG_LEN: usize = 16;
 
+/// Derives the X25519 public key from a base64-encoded private key.
+pub fn derive_public_key(private_key_b64: &str) -> Result<[u8; 32]> {
+    let priv_bytes: [u8; 32] = BASE64_DECODE
+        .decode(private_key_b64.trim())
+        .context("Invalid base64 in PrivateKey")?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("PrivateKey must be 32 bytes, got {}", v.len()))?;
+    let secret = StaticSecret::from(priv_bytes);
+    let public = PublicKey::from(&secret);
+    Ok(public.to_bytes())
+}
+
 /// Derives a ChaCha20-Poly1305 shared key from a WireGuard private key
 /// and a peer's public key via X25519 Diffie-Hellman.
 pub fn derive_shared_key(private_key_b64: &str, public_key_b64: &str) -> Result<[u8; 32]> {
