@@ -4,9 +4,18 @@ A peer-to-peer VPN that uses WireGuard configuration files and establishes encry
 
 *Qanah (قَناة) — "tunnel" in Arabic.*
 
-Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP or port forwarding.
+Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP, port forwarding, or control of your upstream network (e.g. when you’re behind CGNAT).
 
 Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration. When there is no direct connection to a destination (e.g. that peer is offline or not in config), traffic can be routed over another connected peer in a single relay hop. Relaying can be disabled with `--no-relay` so that only direct peer routes are used.
+
+## Use Cases
+
+- **Remote access behind CGNAT** — Connect to your home lab, NAS, or dev machine from anywhere, even if your ISP puts you behind CGNAT. No need to open ports or run a central VPN server; WebRTC/ICE handles NAT traversal.
+- **Mesh VPN for small teams** — Give each team member a peer config so everyone can reach each other’s machines (e.g. SSH, RDP, internal services) over an encrypted mesh, without a dedicated VPN server.
+- **Works when WireGuard/UDP VPNs are blocked** — If the WireGuard protocol (or outbound UDP) is blocked by your ISP/country/network, Qanah can still work by carrying packets over WebRTC/ICE (often over standard ports) while using the same WireGuard-style configs.
+- **Site-to-site over restrictive networks** — Link two networks (e.g. office and colo) when only outbound HTTPS or MQTT is allowed. Signaling over MQTT and WebRTC over standard ports can work where classic VPNs are blocked.
+- **Temporary secure links** — Spin up a tunnel for a one-off session (pair programming, support access, demos) using manual signaling (`offer`/`answer`) and existing WireGuard keys; no long-lived VPN infrastructure.
+- **Development and testing** — Run multiple peers locally or in CI with different configs to test routing, relaying, and NAT scenarios without real hardware.
 
 ## Building
 
