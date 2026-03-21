@@ -52,6 +52,23 @@ pub fn derive_shared_key(private_key_b64: &str, public_key_b64: &str) -> Result<
     Ok(shared_secret.to_bytes())
 }
 
+/// Mixes a WireGuard PresharedKey into the shared secret.
+/// Provides an additional layer of symmetric authentication and post-quantum resistance.
+/// Both peers must use the same PSK to communicate.
+pub fn apply_preshared_key(shared_key: &[u8; 32], psk_b64: &str) -> Result<[u8; 32]> {
+    let psk_bytes: [u8; 32] = BASE64_DECODE
+        .decode(psk_b64.trim())
+        .context("Invalid base64 in PresharedKey")?
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow::anyhow!("PresharedKey must be 32 bytes, got {}", v.len()))?;
+
+    let mut h = Sha256::new();
+    h.update(shared_key);
+    h.update(&psk_bytes);
+    h.update(b"qanah-psk-v1");
+    Ok(h.finalize().into())
+}
+
 /// Derive a purpose-specific key from the root shared secret.
 /// Each `label` produces a cryptographically independent key.
 pub fn derive_subkey(shared_key: &[u8; 32], label: &[u8]) -> [u8; 32] {

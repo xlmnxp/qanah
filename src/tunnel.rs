@@ -12,6 +12,8 @@ use crate::crypto::PacketCipher;
 
 // Relay envelope: first byte 0x01 = relay, then 1 byte addr family (4 or 6), then 4 or 16 bytes dst IP, then inner packet.
 // Any other first byte (e.g. 0x45 IPv4, 0x60 IPv6) = direct IP packet.
+// First byte 0x00 = keepalive (no payload, silently dropped by receiver).
+const KEEPALIVE_BYTE: u8 = 0x00;
 const RELAY_TYPE_RELAY: u8 = 0x01;
 const ADDR_FAMILY_IPV4: u8 = 4;
 const ADDR_FAMILY_IPV6: u8 = 6;
@@ -34,18 +36,22 @@ pub fn encode_relay_envelope(dst: IpAddr, inner: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Decoded packet: either a direct IP packet or a relay envelope (final_dst, inner payload).
+/// Decoded packet: either a direct IP packet, a relay envelope, or a keepalive.
 #[derive(Debug)]
 pub enum DecodedPacket<'a> {
     Direct(&'a [u8]),
     Relay(IpAddr, &'a [u8]),
+    Keepalive,
 }
 
-/// If the decrypted payload starts with RELAY_TYPE_RELAY, parse envelope and return Relay(dst, inner).
-/// Otherwise return Direct(whole payload).
+/// Decode an incoming plaintext payload.
+/// 0x00 = keepalive, 0x01 = relay envelope, anything else = direct IP packet.
 pub fn decode_packet(pkt: &[u8]) -> Option<DecodedPacket<'_>> {
     if pkt.is_empty() {
         return None;
+    }
+    if pkt[0] == KEEPALIVE_BYTE {
+        return Some(DecodedPacket::Keepalive);
     }
     if pkt[0] != RELAY_TYPE_RELAY {
         return Some(DecodedPacket::Direct(pkt));
@@ -210,7 +216,9 @@ fn packet_dst_ip(pkt: &[u8]) -> Option<IpAddr> {
 }
 
 /// Create and configure a TUN device based on the WireGuard config.
-pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
+/// The interface will be named `iface_name` (e.g. derived from the config filename).
+/// Returns the async device and the confirmed interface name.
+pub fn create_tun_device(config: &WgConfig, iface_name: &str) -> Result<(tun::AsyncDevice, String)> {
     let mtu = config.interface.mtu.unwrap_or(1400);
 
     let ipv4_address: Vec<_> = config
@@ -227,7 +235,7 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
         .collect();
 
     let mut tun_config = tun::Configuration::default();
-    tun_config.mtu(mtu as u16).up();
+    tun_config.tun_name(iface_name).mtu(mtu as u16).up();
 
     if let Some(v4) = ipv4_address.first() {
         match v4.addr {
@@ -275,7 +283,7 @@ pub fn create_tun_device(config: &WgConfig) -> Result<tun::AsyncDevice> {
     let async_device =
         tun::AsyncDevice::new(device).context("Failed to create async TUN device")?;
 
-    Ok(async_device)
+    Ok((async_device, dev_name))
 }
 
 fn disable_rp_filter(dev_name: &str) {
@@ -406,8 +414,31 @@ pub async fn peer_to_tun(
                 // Forward without allowing further relay to avoid loops
                 routing_table.route_packet(inner, false).await;
             }
+            DecodedPacket::Keepalive => {}
         }
     }
 
     info!("Peer packet stream ended — TUN writer stopped");
+}
+
+/// Sends periodic keepalive packets over a peer's data channel to keep NAT mappings alive.
+/// Runs until the data channel errors (peer has disconnected).
+pub async fn send_keepalives(
+    data_channel: Arc<RTCDataChannel>,
+    cipher: PacketCipher,
+    interval_secs: u16,
+) {
+    let interval = tokio::time::Duration::from_secs(interval_secs as u64);
+    loop {
+        tokio::time::sleep(interval).await;
+        match cipher.encrypt(&[KEEPALIVE_BYTE]) {
+            Ok(encrypted) => {
+                if let Err(e) = data_channel.send(&bytes::Bytes::from(encrypted)).await {
+                    tracing::debug!(error = %e, "Keepalive send failed — stopping");
+                    break;
+                }
+            }
+            Err(e) => tracing::debug!(error = %e, "Keepalive encrypt failed"),
+        }
+    }
 }

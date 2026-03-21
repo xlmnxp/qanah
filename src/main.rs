@@ -113,12 +113,25 @@ async fn main() -> Result<()> {
 
     let our_public_key = crypto::derive_public_key(&wg_config.interface.private_key)?;
 
+    // Derive interface name from config filename (e.g. wg0.conf → wg0), like wg-quick
+    let iface_name = cli.config
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("qanah0")
+        .to_string();
+
+    // Run PreUp commands before bringing the interface up
+    run_hooks(&wg_config.interface.pre_up, &iface_name);
+
     // Create TUN device immediately
     info!("Creating TUN device and setting up routing...");
-    let tun_dev = tunnel::create_tun_device(&wg_config)?;
+    let (tun_dev, iface_name) = tunnel::create_tun_device(&wg_config, &iface_name)?;
     let (tun_writer, tun_reader) = tun_dev
         .split()
         .map_err(|e| anyhow::anyhow!("Failed to split TUN device: {e}"))?;
+
+    // Run PostUp commands after the interface and routes are configured
+    run_hooks(&wg_config.interface.post_up, &iface_name);
 
     let tun_writer = Arc::new(Mutex::new(tun_writer));
     let routing_table = Arc::new(RoutingTable::new());
@@ -140,12 +153,17 @@ async fn main() -> Result<()> {
 
     let no_relay = cli.no_relay;
 
+    let pre_down = wg_config.interface.pre_down.clone();
+    let post_down = wg_config.interface.post_down.clone();
+
     // Spawn each peer connection concurrently
     for (i, peer_config) in wg_config.peers.iter().enumerate() {
         let peer_idx = i + 1;
         let private_key = private_key.clone();
         let peer_public_key = peer_config.public_key.clone();
         let allowed_ips = peer_config.allowed_ips.clone();
+        let preshared_key = peer_config.preshared_key.clone();
+        let persistent_keepalive = peer_config.persistent_keepalive;
         let stun_urls = stun_urls.clone();
         let turn_config = turn_config.clone();
         let signal_server = signal_server.clone();
@@ -160,6 +178,8 @@ async fn main() -> Result<()> {
                 peer_public_key,
                 our_public_key,
                 allowed_ips,
+                preshared_key,
+                persistent_keepalive,
                 manual_mode,
                 signal_server,
                 stun_urls,
@@ -174,9 +194,25 @@ async fn main() -> Result<()> {
 
     tokio::signal::ctrl_c().await?;
     info!("Shutting down — closing tunnel and disconnecting peers...");
+    run_hooks(&pre_down, &iface_name);
     send_task.abort();
+    run_hooks(&post_down, &iface_name);
 
     Ok(())
+}
+
+/// Execute a list of shell commands, substituting `%i` with the interface name.
+/// Each command is run via `sh -c`. Errors are logged but do not abort startup/shutdown.
+fn run_hooks(commands: &[String], iface: &str) {
+    for cmd in commands {
+        let cmd = cmd.replace("%i", iface);
+        info!(cmd = %cmd, "Running hook");
+        match std::process::Command::new("sh").args(["-c", &cmd]).status() {
+            Ok(status) if status.success() => {}
+            Ok(status) => warn!(cmd = %cmd, code = %status, "Hook exited with non-zero status"),
+            Err(e) => error!(cmd = %cmd, error = %e, "Failed to run hook"),
+        }
+    }
 }
 
 /// Reconnect loop: keeps trying to connect to a peer, removes from routing
@@ -187,6 +223,8 @@ async fn peer_connection_loop(
     peer_public_key: String,
     our_public_key: [u8; 32],
     allowed_ips: Vec<config::CidrAddress>,
+    preshared_key: Option<String>,
+    persistent_keepalive: Option<u16>,
     manual_mode: Option<Mode>,
     signal_server: String,
     stun_urls: Option<Arc<Vec<String>>>,
@@ -217,6 +255,8 @@ async fn peer_connection_loop(
             &peer_public_key,
             our_public_key,
             allowed_ips.clone(),
+            preshared_key.as_deref(),
+            persistent_keepalive,
             manual_mode,
             &signal_server,
             stun_urls.as_deref().cloned(),
@@ -273,6 +313,8 @@ async fn connect_peer(
     peer_public_key: &str,
     our_public_key: [u8; 32],
     allowed_ips: Vec<config::CidrAddress>,
+    preshared_key: Option<&str>,
+    persistent_keepalive: Option<u16>,
     manual_mode: Option<Mode>,
     signal_server: &str,
     stun_urls: Option<Vec<String>>,
@@ -297,6 +339,13 @@ async fn connect_peer(
     );
 
     let shared_key = crypto::derive_shared_key(private_key, peer_public_key)?;
+    let shared_key = match preshared_key {
+        Some(psk) => {
+            info!(peer = %peer_label, "Applying PresharedKey");
+            crypto::apply_preshared_key(&shared_key, psk)?
+        }
+        None => shared_key,
+    };
     let keys = DerivedKeys::new(&shared_key, is_offerer);
     let encrypt_cipher = PacketCipher::new(&keys.tunnel_send);
     let decrypt_cipher = PacketCipher::new(&keys.tunnel_recv);
@@ -320,6 +369,9 @@ async fn connect_peer(
     );
     dc_open.notified().await;
 
+    // Clone cipher for keepalive task before moving into PeerRoute (shares the nonce counter)
+    let keepalive_cipher = encrypt_cipher.clone();
+
     routing_table
         .add_peer(PeerRoute {
             peer_key: peer_public_key.to_string(),
@@ -338,10 +390,22 @@ async fn connect_peer(
         tunnel::peer_to_tun(tun_writer, vpn_peer.packet_rx, decrypt_cipher, routing_table_recv).await;
     });
 
+    // Spawn keepalive task if PersistentKeepalive is configured
+    let keepalive_task = persistent_keepalive.map(|interval| {
+        let dc = data_channel.clone();
+        info!(peer = %peer_label, interval_secs = interval, "Starting keepalive");
+        tokio::spawn(async move {
+            tunnel::send_keepalives(dc, keepalive_cipher, interval).await;
+        })
+    });
+
     // Wait for the WebRTC connection to drop
     disconnected.notified().await;
 
     recv_task.abort();
+    if let Some(task) = keepalive_task {
+        task.abort();
+    }
     let _ = data_channel.close().await;
 
     Ok(())

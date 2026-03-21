@@ -4,14 +4,14 @@ A peer-to-peer VPN that uses WireGuard configuration files and establishes encry
 
 *Qanah (قَناة) — "tunnel" in Arabic.*
 
-Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP, port forwarding, or control of your upstream network (e.g. when you’re behind CGNAT).
+Instead of the traditional WireGuard UDP transport, Qanah creates a TUN device from the WireGuard config (using the interface address/netmask) and tunnels raw IP packets over a WebRTC data channel. This enables NAT traversal via ICE/STUN without needing a public IP, port forwarding, or control of your upstream network (e.g. when you're behind CGNAT).
 
 Qanah supports mesh networking, allowing multiple peers to connect simultaneously based on the WireGuard configuration. When there is no direct connection to a destination (e.g. that peer is offline or not in config), traffic can be routed over another connected peer in a single relay hop. Relaying can be disabled with `--no-relay` so that only direct peer routes are used.
 
 ## Use Cases
 
 - **Remote access behind CGNAT** — Connect to your home lab, NAS, or dev machine from anywhere, even if your ISP puts you behind CGNAT. No need to open ports or run a central VPN server; WebRTC/ICE handles NAT traversal.
-- **Mesh VPN for small teams** — Give each team member a peer config so everyone can reach each other’s machines (e.g. SSH, RDP, internal services) over an encrypted mesh, without a dedicated VPN server.
+- **Mesh VPN for small teams** — Give each team member a peer config so everyone can reach each other's machines (e.g. SSH, RDP, internal services) over an encrypted mesh, without a dedicated VPN server.
 - **Works when WireGuard/UDP VPNs are blocked** — If the WireGuard protocol (or outbound UDP) is blocked by your ISP/country/network, Qanah can still work by carrying packets over WebRTC/ICE (often over standard ports) while using the same WireGuard-style configs.
 - **Site-to-site over restrictive networks** — Link two networks (e.g. office and colo) when only outbound HTTPS or MQTT is allowed. Signaling over MQTT and WebRTC over standard ports can work where classic VPNs are blocked.
 - **Temporary secure links** — Spin up a tunnel for a one-off session (pair programming, support access, demos) using manual signaling (`offer`/`answer`) and existing WireGuard keys; no long-lived VPN infrastructure.
@@ -26,6 +26,8 @@ cargo build --release
 ## Usage
 
 Each peer needs a WireGuard-style config file. The `[Interface]` section provides the local address and keys, while the `[Peer]` sections provide the remote peers' public keys and allowed IPs.
+
+The TUN interface is named after the config file — `wg0.conf` creates an interface named `wg0`, matching the wg-quick convention.
 
 By default, Qanah uses an MQTT broker to automatically exchange WebRTC signaling data (offer/answer), so peers just run one command each and connections are established automatically.
 
@@ -125,11 +127,11 @@ sudo ./target/release/qanah -c peer1.conf \
 sudo ./target/release/qanah -c peer1.conf \
   --turn-url turn:turn.example.com:3478 \
   --turn-username myuser \
-  --turn-credential mypassword \
+  --turn-credential mypassword
 
 # Custom MQTT signaling server
 sudo ./target/release/qanah -c peer1.conf \
-  --signal-server mqtt.example.com:1883 \
+  --signal-server mqtt.example.com:1883
 
 # Disable relaying (only direct peer routes; no traffic via intermediate peers)
 sudo ./target/release/qanah -c peer1.conf --no-relay
@@ -153,15 +155,18 @@ sudo ./target/release/qanah -c peer1.conf \
 ## How It Works
 
 1. Parses a WireGuard `.conf` file to extract the interface address, keys, and peer info
-2. Derives a shared secret from your X25519 PrivateKey and the peer's PublicKey
-3. Derives independent keys for tunnel encryption (per-direction) and signaling
-4. Exchanges WebRTC signaling data via MQTT (or manual copy-paste when using subcommands)
-5. Establishes a WebRTC peer connection with ICE/STUN/TURN for NAT traversal
-6. Creates a TUN device with the configured IP address and netmask
-7. Opens a WebRTC data channel labeled `vpn-tunnel`
-8. Encrypts all IP packets with ChaCha20-Poly1305 before sending over the data channel
-9. Forwards encrypted packets bidirectionally between the TUN device and the data channel
-10. If no peer has the destination in its AllowedIPs (no direct route), sends the packet to the first connected peer as a relay envelope; that peer decrypts and routes the inner packet (direct or to its TUN), so traffic can reach destinations via one relay hop
+2. Runs any `PreUp` commands from the config
+3. Creates a TUN device named after the config file (e.g. `wg0.conf` → `wg0`) with the configured IP address and routes
+4. Runs any `PostUp` commands from the config
+5. Derives a shared secret from your X25519 `PrivateKey` and the peer's `PublicKey`; if a `PresharedKey` is set, it is mixed in for additional security
+6. Derives independent keys for tunnel encryption (per-direction) and signaling
+7. Exchanges WebRTC signaling data via MQTT (or manual copy-paste when using subcommands)
+8. Establishes a WebRTC peer connection with ICE/STUN/TURN for NAT traversal
+9. Opens a WebRTC data channel and encrypts all IP packets with ChaCha20-Poly1305 before sending
+10. Forwards encrypted packets bidirectionally between the TUN device and the data channel
+11. If `PersistentKeepalive` is set, sends periodic keepalive packets to maintain NAT mappings
+12. If no peer has the destination in its `AllowedIPs`, sends the packet to the first relay-capable peer wrapped in a relay envelope; that peer routes the inner packet onward (one hop only)
+13. On shutdown (Ctrl+C), runs `PreDown` commands, stops all tasks, then runs `PostDown` commands
 
 ## Requirements
 
@@ -171,17 +176,31 @@ sudo ./target/release/qanah -c peer1.conf \
 
 ## Configuration
 
-The tool reads standard WireGuard config files. Relevant fields:
+Qanah reads standard WireGuard config files. The config filename (without `.conf`) becomes the TUN interface name, just like wg-quick.
 
-| Field | Section | Description |
-|-------|---------|-------------|
-| `Address` | `[Interface]` | Comma-separated CIDR addresses for the TUN device (e.g. `10.0.0.1/24, fd00::1/64`) |
-| `MTU` | `[Interface]` | MTU for the TUN device (default: `1400`) |
-| `PrivateKey` | `[Interface]` | X25519 private key used for shared secret derivation |
-| `PublicKey` | `[Peer]` | Peer's X25519 public key used for shared secret derivation |
-| `AllowedIPs` | `[Peer]` | CIDR ranges to route through the tunnel (e.g. `10.0.0.2/32, fd00::2/128`) |
+### `[Interface]` fields
 
-Multiple `[Peer]` sections are supported for mesh networking.
+| Field | Description |
+|-------|-------------|
+| `PrivateKey` | X25519 private key used for shared secret derivation *(required)* |
+| `Address` | CIDR address(es) for the TUN device, comma-separated or on multiple lines (e.g. `10.0.0.1/24, fd00::1/64`) *(required)* |
+| `MTU` | MTU for the TUN device (default: `1400`) |
+| `DNS` | DNS server(s) — parsed but not yet applied to the system |
+| `ListenPort` | UDP listen port — parsed but not used (WebRTC handles transport) |
+| `PreUp` | Shell command(s) to run before the interface is created. `%i` is substituted with the interface name. Can appear multiple times. |
+| `PostUp` | Shell command(s) to run after the interface and routes are configured. `%i` is substituted with the interface name. Can appear multiple times. |
+| `PreDown` | Shell command(s) to run before the interface is taken down. `%i` is substituted with the interface name. Can appear multiple times. |
+| `PostDown` | Shell command(s) to run after the interface is taken down. `%i` is substituted with the interface name. Can appear multiple times. |
+
+### `[Peer]` fields
+
+| Field | Description |
+|-------|-------------|
+| `PublicKey` | Peer's X25519 public key *(required)* |
+| `AllowedIPs` | CIDR ranges to route through this peer, comma-separated or on multiple lines |
+| `PresharedKey` | Optional 32-byte symmetric key mixed into the handshake for post-quantum resistance. Both peers must use the same value. |
+| `PersistentKeepalive` | Send a keepalive packet every N seconds to maintain NAT mappings (e.g. `25`) |
+| `Endpoint` | Peer's IP and port — parsed but not used (WebRTC/ICE handles connectivity) |
 
 ### Example Config
 
@@ -189,14 +208,19 @@ Multiple `[Peer]` sections are supported for mesh networking.
 [Interface]
 PrivateKey = <base64-encoded-x25519-private-key>
 Address = 10.0.0.1/24, fd00::1/64
+PostUp = iptables -A POSTROUTING -o %i -j MASQUERADE
+PostDown = iptables -D POSTROUTING -o %i -j MASQUERADE
 
 [Peer]
 PublicKey = <base64-encoded-x25519-public-key-peer2>
 AllowedIPs = 10.0.0.2/32, fd00::2/128
+PresharedKey = <base64-encoded-32-byte-psk>
+PersistentKeepalive = 25
 
 [Peer]
 PublicKey = <base64-encoded-x25519-public-key-peer3>
 AllowedIPs = 10.0.0.3/32, fd00::3/128
+PersistentKeepalive = 25
 ```
 
 ## License

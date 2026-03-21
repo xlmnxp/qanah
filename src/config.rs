@@ -62,6 +62,10 @@ pub struct InterfaceConfig {
     pub listen_port: Option<u16>,
     pub dns: Option<String>,
     pub mtu: Option<u16>,
+    pub pre_up: Vec<String>,
+    pub post_up: Vec<String>,
+    pub pre_down: Vec<String>,
+    pub post_down: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +136,12 @@ impl WgConfig {
         map.get(key).and_then(|v| v.last().cloned())
     }
 
+    /// Collect all values for a key, one entry per line (no CSV splitting).
+    /// Used for shell command fields like PreUp/PostUp where commas are significant.
+    fn get_all_lines(map: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
+        map.get(key).cloned().unwrap_or_default()
+    }
+
     /// Collect all comma-separated values across all occurrences of a key.
     /// Handles both repeated lines and comma-separated values on a single line.
     fn get_all_csv(map: &HashMap<String, Vec<String>>, key: &str) -> Vec<String> {
@@ -174,12 +184,21 @@ impl WgConfig {
                 let dns = Self::get_first(map, "dns");
                 let mtu = Self::get_first(map, "mtu").and_then(|v| v.parse::<u16>().ok());
 
+                let pre_up = Self::get_all_lines(map, "preup");
+                let post_up = Self::get_all_lines(map, "postup");
+                let pre_down = Self::get_all_lines(map, "predown");
+                let post_down = Self::get_all_lines(map, "postdown");
+
                 *interface = Some(InterfaceConfig {
                     private_key,
                     addresses,
                     listen_port,
                     dns,
                     mtu,
+                    pre_up,
+                    post_up,
+                    pre_down,
+                    post_down,
                 });
             }
             "Peer" => {
